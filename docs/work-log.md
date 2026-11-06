@@ -1307,3 +1307,17 @@
   steam-shortcut-editor, and the dialog stories were checked in a browser. Not run:
   the packaged app, real launchers, launching a game. Real launcher configs were
   never read; all tests use temp fixtures.
+
+- Hardened launcher export after an independent review: Steam shortcuts are matched by a
+  `DLSITE_MANAGER_WORK` marker in launch options instead of by folder; compound launch
+  options, non-UTF-8 options and `Exe` paths with shell-expandable characters are refused;
+  tool visibility is checked per Steam install; running Faugus Launcher and Heroic now need the
+  same acknowledgement as Steam, and the backend flags refusals so the form can ask; moving an
+  earlier export to another prefix needs explicit consent; prefix overlap checks resolve
+  symlinks and cover other works; prefix folders are created only for valid targets; failed
+  results keep backup paths and rollback errors; backups keep file modes; dangling symlinks
+  are preserved; `float_roundtrip` is on; duplicate-case VDF sections are handled. Real-launcher
+  check (faugus-launcher 2.5.7-1 heroic-games-launcher 2.22.4-1): each listed the exported entry under headless gamescope with a
+  throwaway HOME and XDG folders; Heroic's analytics prompt was declined through a local
+  debugging port, inside that home. The real config folders' timestamps were unchanged. Steam
+  and launching were not tested. Validation commands as in the previous entry.

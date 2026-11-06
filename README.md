@@ -58,9 +58,9 @@ Existing folders can be scanned into the library as local-only / not-owned works
 
 Open a downloaded work and choose **Export to launchers** to add it to Steam, Faugus Launcher or Heroic so it runs through a Proton build you pick. You choose the executable from the `.exe` files in the work's folder, the compatibility tool, the display name and the Wine prefix. Each work defaults to its own prefix under `~/Games/dlsite-manager/prefixes`.
 
-Exporting again updates the same entry. Launcher files are backed up beside the original (`*.dlsite-manager-<time>.bak`) before any change and are left untouched if they cannot be parsed. Prefixes are never deleted. Steam overwrites its files when it exits, so close Steam before exporting; the app warns and asks for confirmation if it is running.
+Exporting again updates the same entry and never moves a launcher to a different prefix without confirmation. Steam shortcuts this app did not create are left alone. Launcher files are backed up beside the original (`*.dlsite-manager-<time>.bak`) before any change and are left untouched if they cannot be parsed. Prefixes are never deleted. A running launcher can overwrite an export (Steam on exit, Faugus Launcher on its next save, Heroic when it saves a game's settings), so close it first; the app asks for confirmation if one is running. Steam launch options that are more than one simple command are refused rather than guessed at.
 
-This has been tested only with automated tests against fixture files written from the launchers' source code. It has not yet been tried with real Steam, Faugus Launcher or Heroic installs, or with launching a game. Flatpak launchers need filesystem access to the work, the prefix and the tool, which the app does not configure.
+Verified so far: automated tests against fixture files written from the launchers' source code, and exported entries appearing in the game lists of real Faugus Launcher and Heroic with throwaway home folders. Not verified: Steam reading the export, the chosen Proton tool and prefix being applied, or launching a game. Flatpak launchers need filesystem access to the work, the prefix and the tool, which the app does not configure.
 
 ### Settings
 
