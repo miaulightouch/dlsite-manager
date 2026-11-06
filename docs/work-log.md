@@ -1321,3 +1321,10 @@
   throwaway HOME and XDG folders; Heroic's analytics prompt was declined through a local
   debugging port, inside that home. The real config folders' timestamps were unchanged. Steam
   and launching were not tested. Validation commands as in the previous entry.
+
+- Built the AppImage locally (updater artifacts off through a `--config` override, not
+  committed) and drove the export dialog with xdotool under headless gamescope in a throwaway
+  home, with a work created through the real local import code from an uncommitted example,
+  because the frontend exposes no local scan action. Fixed what that found: stale earlier-export
+  details and a still-ticked prefix-move consent after an export, an inaccurate running-launcher
+  sentence, a running warning on unchanged results, and results below the fold.

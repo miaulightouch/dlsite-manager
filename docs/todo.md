@@ -5,7 +5,8 @@
   parser cross-checks, and real Faugus Launcher and Heroic listing the exported entry
   in a throwaway home. Still verify: real Steam (entry appears, keeps launch options,
   honors `STEAM_COMPAT_DATA_PATH`), the chosen tool and prefix being applied in each
-  launcher, launching a game, and the dialog in the packaged app (only Storybook so far).
+  launcher, and launching a game. The frontend has no action for the local folder scan that the
+  README describes (`scan_local_work_downloads` exists only as a command).
 
 - Issue #49 is implemented through three completed plans, in dependency order:
   [localized JSON as the name source](plans/2026-10-19.00-use-localized-names-as-storage-source.md),

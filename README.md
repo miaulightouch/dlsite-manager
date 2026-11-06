@@ -60,7 +60,7 @@ Open a downloaded work and choose **Export to launchers** to add it to Steam, Fa
 
 Exporting again updates the same entry and never moves a launcher to a different prefix without confirmation. Steam shortcuts this app did not create are left alone. Launcher files are backed up beside the original (`*.dlsite-manager-<time>.bak`) before any change and are left untouched if they cannot be parsed. Prefixes are never deleted. A running launcher can overwrite an export (Steam on exit, Faugus Launcher on its next save, Heroic when it saves a game's settings), so close it first; the app asks for confirmation if one is running. Steam launch options that are more than one simple command are refused rather than guessed at.
 
-Verified so far: automated tests against fixture files written from the launchers' source code, and exported entries appearing in the game lists of real Faugus Launcher and Heroic with throwaway home folders. Not verified: Steam reading the export, the chosen Proton tool and prefix being applied, or launching a game. Flatpak launchers need filesystem access to the work, the prefix and the tool, which the app does not configure.
+Verified so far: automated tests against fixture files written from the launchers' source code, the dialog exporting from a locally built AppImage, and exported entries appearing in the game lists of real Faugus Launcher and Heroic with throwaway home folders. Not verified: Steam reading the export, the chosen Proton tool and prefix being applied, or launching a game. Flatpak launchers need filesystem access to the work, the prefix and the tool, which the app does not configure.
 
 ### Settings
 
