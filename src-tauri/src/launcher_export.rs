@@ -68,6 +68,15 @@ async fn export_context(
         .product_detail(&work_id)
         .await
         .map_err(command_error)?;
+    let other_work_roots = state
+        .storage
+        .work_download_paths()
+        .await
+        .map_err(command_error)?
+        .into_iter()
+        .filter(|(other, _)| *other != work_id)
+        .map(|(_, path)| path.into())
+        .collect();
     Ok((
         env,
         WorkRef {
@@ -75,6 +84,7 @@ async fn export_context(
             root,
             title: detail.title,
             cover_url: detail.thumbnail_url,
+            other_work_roots,
         },
     ))
 }

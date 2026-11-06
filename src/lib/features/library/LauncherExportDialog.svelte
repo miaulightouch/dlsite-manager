@@ -11,10 +11,12 @@
   import {
     buildLauncherExportRequest,
     CUSTOM_COMPAT_TOOL,
+    existingExportsFor,
     initialLauncherExportForm,
     launcherExportBlockers,
     launcherLabel,
-    needsSteamAcknowledgement,
+    prefixMoves,
+    runningLauncherLabels,
     type LauncherExportForm,
   } from "$lib/utils/launcher-export";
 
@@ -47,7 +49,13 @@
   });
 
   const blockers = $derived(
-    form && options ? launcherExportBlockers(form, options) : [],
+    form && options ? launcherExportBlockers(form, options, report) : [],
+  );
+  const runningLabels = $derived(
+    form && options ? runningLauncherLabels(form, options, report) : [],
+  );
+  const moves = $derived(
+    form && options ? prefixMoves(form, options, report) : [],
   );
   const statusLabels = {
     created: "Added",
@@ -103,6 +111,14 @@
               <span>
                 {launcherLabel(install)}
                 <small>{install.path}</small>
+                {#each existingExportsFor(options, install.id) as entry}
+                  <small>
+                    Exported{entry.steamUserId
+                      ? ` for user ${entry.steamUserId}`
+                      : ""} as “{entry.displayName ?? "unnamed"}”, prefix {entry.prefix ??
+                      "chosen by the launcher"}
+                  </small>
+                {/each}
               </span>
             </label>
             {#if install.launcher === "steam" && form.selected[install.id]}
@@ -128,19 +144,17 @@
               </div>
             {/if}
           {/each}
-          {#if needsSteamAcknowledgement(form, options)}
+          {#if runningLabels.length}
             <div class="warning" role="alert">
               <p>
-                Steam is running. It overwrites its shortcut and tool files when
-                it exits, which can discard this export. Close Steam first if
+                {runningLabels.join(", ")} running. A running launcher can overwrite
+                or drop this export: Steam when it exits, Faugus Launcher on its next
+                save, Heroic when it next saves the game's settings. Close it first if
                 you can.
               </p>
               <label class="check">
-                <input
-                  type="checkbox"
-                  bind:checked={form.acknowledgeSteamRunning}
-                />
-                <span>Export while Steam is running</span>
+                <input type="checkbox" bind:checked={form.acknowledgeRunning} />
+                <span>Export while it is running</span>
               </label>
             </div>
           {/if}
@@ -205,6 +219,20 @@
             you change it or remove the work.
           </small>
         </label>
+
+        {#if moves.length}
+          <div class="warning" role="alert">
+            <p>This would move earlier exports to the Wine prefix above:</p>
+            {#each moves as move}
+              <p>{move.label}: from {move.from ?? "its current prefix"}</p>
+            {/each}
+            <p>Saves stay in the old prefix and are not copied.</p>
+            <label class="check">
+              <input type="checkbox" bind:checked={form.allowPrefixChange} />
+              <span>Move them to the new prefix</span>
+            </label>
+          </div>
+        {/if}
 
         {#if exportError}
           <p class="error" role="alert">{exportError}</p>

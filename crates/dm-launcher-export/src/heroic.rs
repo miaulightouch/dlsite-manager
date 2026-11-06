@@ -209,6 +209,7 @@ pub(crate) fn read_existing(
     let settings = config.get(&app);
     Ok(Some(ExistingExport {
         install_id: String::new(),
+        steam_user_id: None,
         display_name: entry
             .get("title")
             .and_then(Value::as_str)
@@ -272,14 +273,12 @@ mod tests {
     fn spec(fixture: &Fixture) -> ExportSpec {
         ExportSpec {
             work_id: "RJ1".to_owned(),
-            work_root: PathBuf::from("/games/RJ1"),
             display_name: "月光".to_owned(),
             executable: "/games/RJ1/Game.exe".to_owned(),
             prefix: "/prefixes/RJ1".to_owned(),
             tool: ResolvedTool {
                 id: "Proton-DL".to_owned(),
                 path: Some(fixture.dir.path().join("tools/proton-dl")),
-                discovered: true,
             },
             cover_url: Some("https://img.example/cover.jpg".to_owned()),
         }
@@ -294,7 +293,7 @@ mod tests {
         let fixture = fixture();
         let plan = plan(&fixture.config, &spec(&fixture)).unwrap();
         assert!(plan.created);
-        commit_all(plan.writes).unwrap();
+        commit_all(plan.writes).map_err(|f| f.error).unwrap();
 
         let library = read_json(&library_path(&fixture.config));
         let game = &library["games"][1];
@@ -331,7 +330,9 @@ mod tests {
             r#"{"dlsite-rj1":{"showFps":true,"winePrefix":"/old"},"version":"v0","explicit":false,"extra":1}"#,
         )
         .unwrap();
-        commit_all(plan(&fixture.config, &spec(&fixture)).unwrap().writes).unwrap();
+        commit_all(plan(&fixture.config, &spec(&fixture)).unwrap().writes)
+            .map_err(|f| f.error)
+            .unwrap();
 
         let library = read_json(&library_path(&fixture.config));
         let before: Value = serde_json::from_str(LIBRARY_FIXTURE).unwrap();
@@ -348,7 +349,9 @@ mod tests {
     fn reexport_is_idempotent_and_updates_in_place() {
         let fixture = fixture();
         let first = spec(&fixture);
-        commit_all(plan(&fixture.config, &first).unwrap().writes).unwrap();
+        commit_all(plan(&fixture.config, &first).unwrap().writes)
+            .map_err(|f| f.error)
+            .unwrap();
 
         let second = plan(&fixture.config, &first).unwrap();
         assert!(!second.created);
@@ -363,7 +366,9 @@ mod tests {
         fs::write(&path, customized).unwrap();
         let mut renamed = first;
         renamed.display_name = "Renamed".to_owned();
-        commit_all(plan(&fixture.config, &renamed).unwrap().writes).unwrap();
+        commit_all(plan(&fixture.config, &renamed).unwrap().writes)
+            .map_err(|f| f.error)
+            .unwrap();
         let library = read_json(&path);
         assert_eq!(library["games"].as_array().unwrap().len(), 2);
         assert_eq!(library["games"][1]["title"], "Renamed");
@@ -374,7 +379,9 @@ mod tests {
     fn reads_back_a_previous_export() {
         let fixture = fixture();
         assert!(read_existing(&fixture.config, "RJ1").unwrap().is_none());
-        commit_all(plan(&fixture.config, &spec(&fixture)).unwrap().writes).unwrap();
+        commit_all(plan(&fixture.config, &spec(&fixture)).unwrap().writes)
+            .map_err(|f| f.error)
+            .unwrap();
         let found = read_existing(&fixture.config, "RJ1").unwrap().unwrap();
         assert_eq!(found.prefix.as_deref(), Some("/prefixes/RJ1"));
         assert_eq!(found.display_name.as_deref(), Some("月光"));

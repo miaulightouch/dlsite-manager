@@ -1,5 +1,6 @@
 import type {
   LauncherExportOptions,
+  LauncherExportReport,
   LauncherExportRequest,
   LauncherInstall,
 } from "$lib/model/types";
@@ -14,7 +15,8 @@ export type LauncherExportForm = {
   customTool: string;
   displayName: string;
   prefix: string;
-  acknowledgeSteamRunning: boolean;
+  acknowledgeRunning: boolean;
+  allowPrefixChange: boolean;
 };
 
 const launcherNames = {
@@ -35,8 +37,8 @@ function preferredTool(options: LauncherExportOptions) {
 }
 
 /**
- * Start from what an earlier export stored, so re-exporting never silently moves
- * a work to another prefix.
+ * Start from what an earlier export stored. Launchers can disagree; the form holds
+ * one value, so any selected launcher it would move needs explicit confirmation.
  */
 export function initialLauncherExportForm(
   options: LauncherExportOptions,
@@ -74,7 +76,8 @@ export function initialLauncherExportForm(
     prefix:
       options.existing.find((entry) => entry.prefix)?.prefix ??
       options.defaultPrefix,
-    acknowledgeSteamRunning: false,
+    acknowledgeRunning: false,
+    allowPrefixChange: false,
   };
 }
 
@@ -85,19 +88,74 @@ function selectedInstalls(
   return options.installs.filter((install) => form.selected[install.id]);
 }
 
-export function needsSteamAcknowledgement(
+/**
+ * Selected launchers known to be running. The backend's refusal counts too: the
+ * snapshot in `options` is older than the export and a launcher may have started.
+ */
+export function runningLauncherLabels(
   form: LauncherExportForm,
   options: LauncherExportOptions,
+  report: LauncherExportReport | null = null,
 ) {
-  return selectedInstalls(form, options).some(
-    (install) => install.launcher === "steam" && install.running,
+  const refused = new Set(
+    report?.results
+      .filter((result) => result.needsAcknowledgement)
+      .map((result) => result.installId),
   );
+  return selectedInstalls(form, options)
+    .filter((install) => install.running || refused.has(install.id))
+    .map(launcherLabel);
+}
+
+/** What an earlier export of this work stored, for one launcher. */
+export function existingExportsFor(
+  options: LauncherExportOptions,
+  installId: string,
+) {
+  return options.existing.filter((entry) => entry.installId === installId);
+}
+
+/** Selected earlier exports whose prefix differs from the form's. */
+export function prefixMoves(
+  form: LauncherExportForm,
+  options: LauncherExportOptions,
+  report: LauncherExportReport | null = null,
+) {
+  const prefix = form.prefix.trim();
+  const refused = new Set(
+    report?.results
+      .filter((result) => result.needsPrefixChange)
+      .map((result) => result.installId),
+  );
+  const moves = selectedInstalls(form, options).flatMap((install) =>
+    existingExportsFor(options, install.id)
+      .filter(
+        (entry) =>
+          entry.prefix !== prefix &&
+          (install.launcher !== "steam" ||
+            form.steamUsers[install.id]?.includes(entry.steamUserId ?? "")),
+      )
+      .map((entry) => ({
+        label: entry.steamUserId
+          ? `${launcherLabel(install)} user ${entry.steamUserId}`
+          : launcherLabel(install),
+        from: entry.prefix,
+      })),
+  );
+  const listed = new Set(moves.map((move) => move.label));
+  for (const install of selectedInstalls(form, options)) {
+    if (refused.has(install.id) && ![...listed].some((label) => label.startsWith(launcherLabel(install)))) {
+      moves.push({ label: launcherLabel(install), from: null });
+    }
+  }
+  return moves;
 }
 
 /** Why the form cannot be submitted yet; empty when it can. */
 export function launcherExportBlockers(
   form: LauncherExportForm,
   options: LauncherExportOptions,
+  report: LauncherExportReport | null = null,
 ) {
   const blockers: string[] = [];
   const installs = selectedInstalls(form, options);
@@ -116,8 +174,14 @@ export function launcherExportBlockers(
   if (!form.prefix.trim().startsWith("/")) {
     blockers.push("Enter an absolute Wine prefix path.");
   }
-  if (needsSteamAcknowledgement(form, options) && !form.acknowledgeSteamRunning) {
-    blockers.push("Close Steam or confirm that you want to export while it runs.");
+  if (prefixMoves(form, options, report).length && !form.allowPrefixChange) {
+    blockers.push("Keep the current Wine prefix or confirm moving to the new one.");
+  }
+  if (
+    runningLauncherLabels(form, options, report).length &&
+    !form.acknowledgeRunning
+  ) {
+    blockers.push("Close the running launcher or confirm exporting anyway.");
   }
   return blockers;
 }
@@ -142,6 +206,7 @@ export function buildLauncherExportRequest(
       steamUserIds:
         install.launcher === "steam" ? (form.steamUsers[install.id] ?? []) : [],
     })),
-    acknowledgeSteamRunning: form.acknowledgeSteamRunning,
+    acknowledgeRunning: form.acknowledgeRunning,
+    allowPrefixChange: form.allowPrefixChange,
   };
 }

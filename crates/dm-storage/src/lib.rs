@@ -718,6 +718,18 @@ impl Storage {
             .map(|state| state.unwrap_or_default())
     }
 
+    /// `(work id, folder)` of every work that has one.
+    pub async fn work_download_paths(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT work_id, local_path FROM work_downloads WHERE local_path IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("work_id")?, row.try_get("local_path")?)))
+            .collect()
+    }
+
     pub async fn save_work_download(&self, download: &WorkDownloadUpdate) -> Result<()> {
         let mut transaction = self.begin_write().await?;
 

@@ -47,22 +47,42 @@ pub(crate) struct PendingWrite {
     pub contents: Vec<u8>,
 }
 
+/// What a partly applied launcher export left behind.
+#[derive(Debug)]
+pub(crate) struct CommitFailure {
+    pub error: ExportError,
+    /// Files written before the failure, with their backups.
+    pub files: Vec<FileChange>,
+    pub rollback_errors: Vec<String>,
+}
+
 /// Apply writes in order. If one fails, the earlier ones are restored so a
 /// launcher never keeps half of a multi-file export.
-pub(crate) fn commit_all(writes: Vec<PendingWrite>) -> Result<Vec<FileChange>, ExportError> {
+pub(crate) fn commit_all(writes: Vec<PendingWrite>) -> Result<Vec<FileChange>, CommitFailure> {
     let mut changes: Vec<FileChange> = Vec::with_capacity(writes.len());
     for write in writes {
         match commit(&write) {
             Ok(change) => changes.push(change),
             Err(error) => {
-                for change in changes.iter().rev() {
-                    let _ = rollback(change);
-                }
-                return Err(error);
+                let rollback_errors = rollback_all(&changes);
+                return Err(CommitFailure {
+                    error,
+                    files: changes,
+                    rollback_errors,
+                });
             }
         }
     }
     Ok(changes)
+}
+
+fn rollback_all(changes: &[FileChange]) -> Vec<String> {
+    changes
+        .iter()
+        .rev()
+        .filter_map(|change| rollback(change).err())
+        .map(|error| error.to_string())
+        .collect()
 }
 
 fn commit(write: &PendingWrite) -> Result<FileChange, ExportError> {
@@ -108,8 +128,12 @@ fn rollback(change: &FileChange) -> Result<(), ExportError> {
 }
 
 /// Copy `path` next to itself under a timestamped name that never overwrites.
+/// The copy keeps the original's permissions and is never wider while written.
 pub(crate) fn create_backup(path: &Path) -> Result<PathBuf, ExportError> {
     let bytes = fs::read(path).map_err(|error| io_error(path, error))?;
+    let permissions = fs::metadata(path)
+        .map_err(|error| io_error(path, error))?
+        .permissions();
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let name = path
         .file_name()
@@ -122,12 +146,10 @@ pub(crate) fn create_backup(path: &Path) -> Result<PathBuf, ExportError> {
             format!("-{attempt}")
         };
         let candidate = path.with_file_name(format!("{name}.dlsite-manager-{stamp}{suffix}.bak"));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match create_private(&candidate) {
             Ok(mut file) => {
+                fs::set_permissions(&candidate, permissions)
+                    .map_err(|error| io_error(&candidate, error))?;
                 file.write_all(&bytes)
                     .and_then(|()| file.sync_all())
                     .map_err(|error| io_error(&candidate, error))?;
@@ -143,14 +165,44 @@ pub(crate) fn create_backup(path: &Path) -> Result<PathBuf, ExportError> {
     )))
 }
 
+fn create_private(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// The file a write should replace: symlinks, dangling ones included, keep
+/// their link and the file they point at is written instead.
+fn resolve_target(path: &Path) -> Result<PathBuf, ExportError> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = fs::read_link(&current).map_err(|error| io_error(&current, error))?;
+                current = match current.parent() {
+                    Some(parent) => parent.join(link),
+                    None => link,
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(current),
+            Err(error) => return Err(io_error(&current, error)),
+        }
+    }
+    Err(ExportError::Refused(format!(
+        "{} has too many levels of symbolic links",
+        path.display()
+    )))
+}
+
 /// Write through a same-directory temporary file and rename it into place.
-/// A symlinked target keeps its link: the file it points at is replaced.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), ExportError> {
-    let target = match path.canonicalize() {
-        Ok(target) => target,
-        Err(error) if error.kind() == ErrorKind::NotFound => path.to_path_buf(),
-        Err(error) => return Err(io_error(path, error)),
-    };
+    let target = resolve_target(path)?;
     let parent = target
         .parent()
         .ok_or_else(|| ExportError::Refused(format!("{} has no parent", target.display())))?;
@@ -173,16 +225,17 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), ExportErr
 }
 
 fn write_temp(temp: &Path, target: &Path, contents: &[u8]) -> Result<(), ExportError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp)
-        .map_err(|error| io_error(temp, error))?;
+    let existing = fs::metadata(target).ok().map(|meta| meta.permissions());
+    let mut file = match &existing {
+        Some(_) => create_private(temp),
+        None => OpenOptions::new().write(true).create_new(true).open(temp),
+    }
+    .map_err(|error| io_error(temp, error))?;
+    if let Some(permissions) = existing {
+        fs::set_permissions(temp, permissions).map_err(|error| io_error(temp, error))?;
+    }
     file.write_all(contents)
         .map_err(|error| io_error(temp, error))?;
-    if let Ok(metadata) = fs::metadata(target) {
-        fs::set_permissions(temp, metadata.permissions()).map_err(|error| io_error(temp, error))?;
-    }
     file.sync_all().map_err(|error| io_error(temp, error))
 }
 
@@ -236,7 +289,8 @@ mod tests {
         let path = dir.path().join("a.json");
         fs::write(&path, b"launcher wrote this").unwrap();
         let error = commit_all(vec![pending(&path, Some(b"old"), b"new")]).unwrap_err();
-        assert!(error.to_string().contains("changed while exporting"));
+        assert!(error.error.to_string().contains("changed while exporting"));
+        assert!(error.files.is_empty());
         assert_eq!(fs::read(&path).unwrap(), b"launcher wrote this");
     }
 
@@ -248,13 +302,20 @@ mod tests {
         let conflicted = dir.path().join("conflicted.json");
         fs::write(&updated, b"old").unwrap();
         fs::write(&conflicted, b"other").unwrap();
-        let error = commit_all(vec![
+        let failure = commit_all(vec![
             pending(&updated, Some(b"old"), b"new"),
             pending(&created, None, b"new"),
             pending(&conflicted, Some(b"expected"), b"new"),
         ])
         .unwrap_err();
-        assert!(error.to_string().contains("changed while exporting"));
+        assert!(failure
+            .error
+            .to_string()
+            .contains("changed while exporting"));
+        assert!(failure.rollback_errors.is_empty());
+        assert_eq!(failure.files.len(), 2);
+        let backup = failure.files[0].backup.as_deref().unwrap();
+        assert_eq!(fs::read(backup).unwrap(), b"old");
         assert_eq!(fs::read(&updated).unwrap(), b"old");
         assert!(!created.exists());
         assert_eq!(fs::read(&conflicted).unwrap(), b"other");
@@ -268,6 +329,48 @@ mod tests {
         write_atomic(&path, b"data2").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"data2");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rollback_failures_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let change = FileChange {
+            path: dir.path().join("a.json").to_string_lossy().into_owned(),
+            action: FileAction::Updated,
+            backup: Some(dir.path().join("gone.bak").to_string_lossy().into_owned()),
+        };
+        let errors = rollback_all(&[change]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("gone.bak"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backups_keep_the_original_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.vdf");
+        fs::write(&path, b"secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let backup = create_backup(&path).unwrap();
+        let mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_kept_and_its_target_written() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("elsewhere/real.json");
+        let link = dir.path().join("link.json");
+        symlink(&real, &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&real).unwrap(), b"new");
     }
 
     #[cfg(unix)]

@@ -350,6 +350,7 @@ export type LauncherExportOptions = {
   compatTools: { id: string; displayName: string; path: string | null }[];
   existing: {
     installId: string;
+    steamUserId: string | null;
     displayName: string | null;
     executable: string | null;
     prefix: string | null;
@@ -364,7 +365,8 @@ export type LauncherExportRequest = {
   compatTool: string;
   prefix: string;
   targets: { installId: string; steamUserIds: string[] }[];
-  acknowledgeSteamRunning: boolean;
+  acknowledgeRunning: boolean;
+  allowPrefixChange: boolean;
 };
 
 export type LauncherExportReport = {
@@ -380,5 +382,7 @@ export type LauncherExportReport = {
     }[];
     warnings: string[];
     error: string | null;
+    needsAcknowledgement: boolean;
+    needsPrefixChange: boolean;
   }[];
 };

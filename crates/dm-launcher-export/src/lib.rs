@@ -20,8 +20,8 @@ pub use discovery::{
 pub use exe_scan::ExeCandidate;
 pub use fsio::{FileAction, FileChange};
 
-use discovery::{resolve_tool, ResolvedTool};
-use fsio::{commit_all, PendingWrite};
+use discovery::{resolve_tool, steam_can_see_tool, ResolvedTool};
+use fsio::{commit_all, CommitFailure, PendingWrite};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -31,6 +31,12 @@ pub enum ExportError {
     Invalid(String),
     #[error("{0}")]
     Refused(String),
+    /// The launcher is running; the request may repeat with acknowledgement.
+    #[error("{0}")]
+    NeedsAcknowledgement(String),
+    /// An earlier export used another prefix; the request may repeat with consent.
+    #[error("{0}")]
+    PrefixChange(String),
     #[error("{}: {message}; the file was not changed", path.display())]
     Corrupt { path: PathBuf, message: String },
     #[error("{}: {source}", path.display())]
@@ -51,12 +57,15 @@ pub struct WorkRef {
     pub root: PathBuf,
     pub title: String,
     pub cover_url: Option<String>,
+    /// Folders of other works; a prefix may not overlap them either.
+    pub other_work_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExistingExport {
     pub install_id: String,
+    pub steam_user_id: Option<String>,
     pub display_name: Option<String>,
     pub executable: Option<String>,
     pub prefix: Option<String>,
@@ -93,8 +102,12 @@ pub struct ExportRequest {
     pub compat_tool: String,
     pub prefix: String,
     pub targets: Vec<ExportTarget>,
+    /// Export even to launchers that are running and may overwrite the result.
     #[serde(default)]
-    pub acknowledge_steam_running: bool,
+    pub acknowledge_running: bool,
+    /// Move launchers whose earlier export used a different prefix.
+    #[serde(default)]
+    pub allow_prefix_change: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -115,6 +128,10 @@ pub struct TargetResult {
     pub files: Vec<FileChange>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
+    /// The failure can be retried by acknowledging a running launcher.
+    pub needs_acknowledgement: bool,
+    /// The failure can be retried by allowing a prefix change.
+    pub needs_prefix_change: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -127,7 +144,6 @@ pub struct ExportReport {
 #[derive(Debug)]
 pub(crate) struct ExportSpec {
     pub work_id: String,
-    pub work_root: PathBuf,
     pub display_name: String,
     pub executable: String,
     pub prefix: String,
@@ -177,22 +193,12 @@ pub fn prepare_options(env: &ExportEnv, work: &WorkRef) -> Result<ExportOptions,
     let mut existing = Vec::new();
     let mut warnings = Vec::new();
     for install in &installs {
-        let path = Path::new(&install.path);
-        let found =
-            match install.launcher {
-                LauncherKind::Steam => {
-                    let users: Vec<String> = install
-                        .steam_users
-                        .iter()
-                        .map(|user| user.id.clone())
-                        .collect();
-                    steam::read_existing(path, &users, &root)
-                }
-                LauncherKind::Faugus => faugus::read_existing(path, &work.work_id)
-                    .map(|found| found.into_iter().collect()),
-                LauncherKind::Heroic => heroic::read_existing(path, &work.work_id)
-                    .map(|found| found.into_iter().collect()),
-            };
+        let users: Vec<String> = install
+            .steam_users
+            .iter()
+            .map(|user| user.id.clone())
+            .collect();
+        let found = existing_exports(install, &users, &work.work_id);
         match found {
             Ok(found) => existing.extend(found.into_iter().map(|mut entry| {
                 entry.install_id = install.id.clone();
@@ -217,6 +223,25 @@ pub fn prepare_options(env: &ExportEnv, work: &WorkRef) -> Result<ExportOptions,
         existing,
         warnings,
     })
+}
+
+/// Canonicalize the part of `path` that exists, so symlinks cannot hide where a
+/// folder that is not created yet will end up.
+fn resolve_through_symlinks(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            return rest.iter().rev().fold(resolved, |out, part| out.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 fn has_control_characters(value: &str) -> bool {
@@ -282,15 +307,26 @@ fn validate_request(
             "the Wine prefix must be an absolute path".to_owned(),
         ));
     }
-    if prefix_path.starts_with(&work_root) || prefix_path.starts_with(&work.root) {
+    let resolved_prefix = resolve_through_symlinks(prefix_path);
+    let overlaps =
+        |folder: &Path| resolved_prefix.starts_with(folder) || folder.starts_with(&resolved_prefix);
+    if overlaps(&work_root) {
         return Err(ExportError::Invalid(
-            "the Wine prefix must be outside the work's folder, because re-downloading replaces that folder".to_owned(),
+            "the Wine prefix must not contain or be inside the work's folder, because re-downloading replaces that folder".to_owned(),
+        ));
+    }
+    if work
+        .other_work_roots
+        .iter()
+        .any(|folder| overlaps(&resolve_through_symlinks(folder)))
+    {
+        return Err(ExportError::Invalid(
+            "the Wine prefix must not contain or be inside another work's folder".to_owned(),
         ));
     }
 
     Ok(ExportSpec {
         work_id: work.work_id.clone(),
-        work_root,
         display_name: display_name.to_owned(),
         executable,
         prefix: prefix.to_owned(),
@@ -299,12 +335,55 @@ fn validate_request(
     })
 }
 
+fn running_refusal(launcher: LauncherKind) -> &'static str {
+    match launcher {
+        LauncherKind::Steam => {
+            "Steam is running and overwrites these files when it exits; close Steam first or confirm the export anyway"
+        }
+        LauncherKind::Faugus => {
+            "Faugus Launcher is running and rewrites its game list from memory, which drops new entries; close it first or confirm the export anyway"
+        }
+        LauncherKind::Heroic => {
+            "Heroic is running and can overwrite a game's settings from memory; close it first or confirm the export anyway"
+        }
+    }
+}
+
+fn running_warning(launcher: LauncherKind) -> &'static str {
+    match launcher {
+        LauncherKind::Steam => "Steam was running: it may overwrite this export when it exits",
+        LauncherKind::Faugus => {
+            "Faugus Launcher was running: its next save can drop this export, and it shows the entry only after a restart"
+        }
+        LauncherKind::Heroic => {
+            "Heroic was running: it can overwrite these settings until it is restarted"
+        }
+    }
+}
+
+fn existing_exports(
+    install: &LauncherInstall,
+    users: &[String],
+    work_id: &str,
+) -> Result<Vec<ExistingExport>, ExportError> {
+    let path = Path::new(&install.path);
+    match install.launcher {
+        LauncherKind::Steam => steam::read_existing(path, users, work_id),
+        LauncherKind::Faugus => {
+            faugus::read_existing(path, work_id).map(|found| found.into_iter().collect())
+        }
+        LauncherKind::Heroic => {
+            heroic::read_existing(path, work_id).map(|found| found.into_iter().collect())
+        }
+    }
+}
+
 fn export_target(
     env: &ExportEnv,
     target: &ExportTarget,
     install: &LauncherInstall,
     spec: &ExportSpec,
-    acknowledge_steam_running: bool,
+    request: &ExportRequest,
 ) -> Result<(Plan, Vec<String>), ExportError> {
     let mut warnings = Vec::new();
     if install.flavor == InstallFlavor::Flatpak {
@@ -313,46 +392,106 @@ fn export_target(
                 .to_owned(),
         );
     }
+    if install.running {
+        if !request.acknowledge_running {
+            return Err(ExportError::NeedsAcknowledgement(
+                running_refusal(install.launcher).to_owned(),
+            ));
+        }
+        warnings.push(running_warning(install.launcher).to_owned());
+    }
+    if install.launcher == LauncherKind::Steam {
+        if target.steam_user_ids.is_empty() {
+            return Err(ExportError::Invalid(
+                "choose at least one Steam user".to_owned(),
+            ));
+        }
+        for user in &target.steam_user_ids {
+            if !install.steam_users.iter().any(|known| known.id == *user) {
+                return Err(ExportError::Invalid(format!("unknown Steam user {user}")));
+            }
+        }
+    }
+    if !request.allow_prefix_change {
+        let moved = existing_exports(install, &target.steam_user_ids, &spec.work_id)?
+            .into_iter()
+            .any(|existing| existing.prefix.as_deref() != Some(spec.prefix.as_str()));
+        if moved {
+            return Err(ExportError::PrefixChange(
+                "this launcher's earlier export uses a different Wine prefix; keep that prefix or confirm the move, because saves stay in the old one"
+                    .to_owned(),
+            ));
+        }
+    }
     let path = Path::new(&install.path);
     let plan = match install.launcher {
         LauncherKind::Steam => {
-            if install.running && !acknowledge_steam_running {
-                return Err(ExportError::Refused(
-                    "Steam is running and overwrites these files when it exits; close Steam first or confirm the export anyway"
-                        .to_owned(),
-                ));
-            }
-            if install.running {
-                warnings.push(
-                    "Steam was running: it may overwrite this export when it exits".to_owned(),
-                );
-            }
-            if target.steam_user_ids.is_empty() {
-                return Err(ExportError::Invalid(
-                    "choose at least one Steam user".to_owned(),
-                ));
-            }
-            for user in &target.steam_user_ids {
-                if !install.steam_users.iter().any(|known| known.id == *user) {
-                    return Err(ExportError::Invalid(format!("unknown Steam user {user}")));
-                }
-            }
-            steam::plan(path, &target.steam_user_ids, spec)?
+            let visible = steam_can_see_tool(env, path, install.flavor, &spec.tool.id);
+            steam::plan(path, &target.steam_user_ids, spec, visible)?
         }
-        LauncherKind::Faugus => {
-            if install.running {
-                warnings.push("Restart Faugus Launcher to see the change".to_owned());
-            }
-            faugus::plan(env, path, spec)?
-        }
-        LauncherKind::Heroic => {
-            if install.running {
-                warnings.push("Restart Heroic to apply the change".to_owned());
-            }
-            heroic::plan(path, spec)?
-        }
+        LauncherKind::Faugus => faugus::plan(env, path, spec)?,
+        LauncherKind::Heroic => heroic::plan(path, spec)?,
     };
     Ok((plan, warnings))
+}
+
+type TargetOutcome = (bool, Vec<FileChange>, Vec<String>);
+
+fn run_target(
+    env: &ExportEnv,
+    target: &ExportTarget,
+    install: Option<&LauncherInstall>,
+    spec: &ExportSpec,
+    request: &ExportRequest,
+) -> Result<TargetOutcome, CommitFailure> {
+    let plain = |error: ExportError| CommitFailure {
+        error,
+        files: Vec::new(),
+        rollback_errors: Vec::new(),
+    };
+    let install = install.ok_or_else(|| {
+        plain(ExportError::Invalid(format!(
+            "launcher {} was not found",
+            target.install_id
+        )))
+    })?;
+    let (plan, mut warnings) = export_target(env, target, install, spec, request).map_err(plain)?;
+    // Only once this launcher's export is known to be valid.
+    std::fs::create_dir_all(&spec.prefix)
+        .map_err(|source| ExportError::Io {
+            path: PathBuf::from(&spec.prefix),
+            source,
+        })
+        .map_err(plain)?;
+    warnings.extend(plan.warnings);
+    let files = commit_all(plan.writes)?;
+    Ok((plan.created, files, warnings))
+}
+
+fn failed_result(
+    target: &ExportTarget,
+    launcher: Option<LauncherKind>,
+    failure: CommitFailure,
+) -> TargetResult {
+    let mut error = failure.error.to_string();
+    if !failure.rollback_errors.is_empty() {
+        error.push_str(&format!(
+            "; these files could not be restored, use their backups: {}",
+            failure.rollback_errors.join("; ")
+        ));
+    } else if !failure.files.is_empty() {
+        error.push_str("; files already written were restored");
+    }
+    TargetResult {
+        install_id: target.install_id.clone(),
+        launcher,
+        status: TargetStatus::Failed,
+        needs_acknowledgement: matches!(failure.error, ExportError::NeedsAcknowledgement(_)),
+        needs_prefix_change: matches!(failure.error, ExportError::PrefixChange(_)),
+        files: failure.files,
+        warnings: Vec::new(),
+        error: Some(error),
+    }
 }
 
 /// Export to each target independently: one launcher's failure leaves its files
@@ -376,37 +515,14 @@ fn run_export(
     request: &ExportRequest,
 ) -> Result<ExportReport, ExportError> {
     let spec = validate_request(env, work, request)?;
-    std::fs::create_dir_all(&spec.prefix).map_err(|source| ExportError::Io {
-        path: PathBuf::from(&spec.prefix),
-        source,
-    })?;
     let installs = discover_installs(env);
     let mut results = Vec::with_capacity(request.targets.len());
     for target in &request.targets {
         let install = installs.iter().find(|known| known.id == target.install_id);
-        let outcome = match install {
-            None => Err(ExportError::Invalid(format!(
-                "launcher {} was not found",
-                target.install_id
-            ))),
-            Some(install) => export_target(
-                env,
-                target,
-                install,
-                &spec,
-                request.acknowledge_steam_running,
-            )
-            .and_then(|(plan, mut warnings)| {
-                warnings.extend(plan.warnings);
-                let created = plan.created;
-                commit_all(plan.writes).map(|files| (created, files, warnings))
-            }),
-        };
         let launcher = install.map(|install| install.launcher);
-        let install_id = target.install_id.clone();
-        results.push(match outcome {
+        results.push(match run_target(env, target, install, &spec, request) {
             Ok((created, files, warnings)) => TargetResult {
-                install_id,
+                install_id: target.install_id.clone(),
                 launcher,
                 status: if files
                     .iter()
@@ -421,15 +537,10 @@ fn run_export(
                 files,
                 warnings,
                 error: None,
+                needs_acknowledgement: false,
+                needs_prefix_change: false,
             },
-            Err(error) => TargetResult {
-                install_id,
-                launcher,
-                status: TargetStatus::Failed,
-                files: Vec::new(),
-                warnings: Vec::new(),
-                error: Some(error.to_string()),
-            },
+            Err(failure) => failed_result(target, launcher, failure),
         });
     }
     Ok(ExportReport {
@@ -479,6 +590,7 @@ mod tests {
             root,
             title: "Title".to_owned(),
             cover_url: None,
+            other_work_roots: Vec::new(),
         };
         Home { dir, env, work }
     }
@@ -498,7 +610,8 @@ mod tests {
                     steam_user_ids: install.steam_users.iter().map(|u| u.id.clone()).collect(),
                 })
                 .collect(),
-            acknowledge_steam_running: false,
+            acknowledge_running: false,
+            allow_prefix_change: false,
         }
     }
 
@@ -584,6 +697,7 @@ mod tests {
         fs::create_dir_all(&process).unwrap();
         fs::write(process.join("comm"), "steam\n").unwrap();
         let mut request = request(&home);
+        request.targets.truncate(1);
         let shortcuts = home
             .env
             .data_home
@@ -596,9 +710,11 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Steam is running"));
+        assert!(refused.results[0].needs_acknowledgement);
         assert!(!shortcuts.exists());
+        assert!(!Path::new(&request.prefix).exists());
 
-        request.acknowledge_steam_running = true;
+        request.acknowledge_running = true;
         let accepted = run_export(&home.env, &home.work, &request).unwrap();
         assert_eq!(accepted.results[0].status, TargetStatus::Created);
         assert!(accepted.results[0]
@@ -606,6 +722,159 @@ mod tests {
             .iter()
             .any(|w| w.contains("overwrite")));
         assert!(shortcuts.exists());
+    }
+
+    fn fake_process(home: &Home, pid: &str, comm: &str, command: &str) {
+        let process = home.env.proc_root.join(pid);
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("comm"), comm).unwrap();
+        fs::write(process.join("cmdline"), command).unwrap();
+    }
+
+    #[test]
+    fn running_faugus_and_heroic_need_acknowledgement_too() {
+        let home = home();
+        fake_process(
+            &home,
+            "7",
+            "python3\n",
+            "/usr/bin/python3\0/usr/bin/faugus-launcher\0",
+        );
+        fake_process(&home, "8", "heroic\n", "/usr/bin/heroic\0");
+        let mut request = request(&home);
+        let games = home.env.data_home.join("faugus-launcher/games.json");
+
+        let refused = run_export(&home.env, &home.work, &request).unwrap();
+        assert_eq!(
+            statuses(&refused),
+            vec![
+                TargetStatus::Created,
+                TargetStatus::Failed,
+                TargetStatus::Failed
+            ]
+        );
+        assert!(!refused.results[0].needs_acknowledgement);
+        assert!(refused.results[1].needs_acknowledgement);
+        assert!(refused.results[2].needs_acknowledgement);
+        assert!(!games.exists());
+
+        request.acknowledge_running = true;
+        let accepted = run_export(&home.env, &home.work, &request).unwrap();
+        assert_eq!(accepted.results[1].status, TargetStatus::Created);
+        assert!(accepted.results[1].warnings[0].contains("next save"));
+        assert!(games.exists());
+        assert!(accepted.results[2].warnings[0].contains("overwrite"));
+    }
+
+    #[test]
+    fn a_different_earlier_prefix_is_not_changed_without_consent() {
+        let home = home();
+        let mut request = request(&home);
+        run_export(&home.env, &home.work, &request).unwrap();
+        let original = request.prefix.clone();
+
+        request.prefix = home.dir.path().join("moved").to_str().unwrap().to_owned();
+        let refused = run_export(&home.env, &home.work, &request).unwrap();
+        assert_eq!(statuses(&refused), vec![TargetStatus::Failed; 3]);
+        assert!(refused
+            .results
+            .iter()
+            .all(|result| result.needs_prefix_change));
+        assert!(!Path::new(&request.prefix).exists());
+        let options = prepare_options(&home.env, &home.work).unwrap();
+        assert!(options
+            .existing
+            .iter()
+            .all(|existing| existing.prefix.as_deref() == Some(original.as_str())));
+
+        request.allow_prefix_change = true;
+        let moved = run_export(&home.env, &home.work, &request).unwrap();
+        assert_eq!(statuses(&moved), vec![TargetStatus::Updated; 3]);
+    }
+
+    #[test]
+    fn a_failed_commit_reports_files_already_written_and_their_backups() {
+        let failure = CommitFailure {
+            error: ExportError::Refused("second file failed".to_owned()),
+            files: vec![FileChange {
+                path: "/x/a".to_owned(),
+                action: FileAction::Updated,
+                backup: Some("/x/a.bak".to_owned()),
+            }],
+            rollback_errors: vec!["/x/a: denied".to_owned()],
+        };
+        let target = ExportTarget {
+            install_id: "steam:/x".to_owned(),
+            steam_user_ids: Vec::new(),
+        };
+        let result = failed_result(&target, Some(LauncherKind::Steam), failure);
+        assert_eq!(result.status, TargetStatus::Failed);
+        assert_eq!(result.files[0].backup.as_deref(), Some("/x/a.bak"));
+        let error = result.error.unwrap();
+        assert!(error.contains("second file failed") && error.contains("/x/a: denied"));
+    }
+
+    #[test]
+    fn a_prefix_is_only_created_for_a_launcher_that_can_be_exported() {
+        let home = home();
+        let mut request = request(&home);
+        fs::write(
+            home.env.data_home.join("faugus-launcher/games.json"),
+            "{corrupt",
+        )
+        .unwrap();
+        request
+            .targets
+            .retain(|target| target.install_id.starts_with("faugus:"));
+        let report = run_export(&home.env, &home.work, &request).unwrap();
+        assert_eq!(report.results[0].status, TargetStatus::Failed);
+        assert!(!Path::new(&request.prefix).exists());
+    }
+
+    #[test]
+    fn prefixes_overlapping_works_are_refused_even_through_symlinks() {
+        let mut home = home();
+        let good = request(&home);
+        let other = home.dir.path().join("library/RJ2");
+        fs::create_dir_all(&other).unwrap();
+        home.work.other_work_roots = vec![other.clone()];
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&home.work.root, home.dir.path().join("link")).unwrap();
+
+        let mut cases = vec![
+            home.dir.path().join("library"),
+            other.join("pfx"),
+            home.work.root.join("not/created/yet"),
+        ];
+        #[cfg(unix)]
+        cases.push(home.dir.path().join("link/pfx"));
+        for prefix in cases {
+            let mut request = good.clone();
+            request.prefix = prefix.to_str().unwrap().to_owned();
+            let error = run_export(&home.env, &home.work, &request).unwrap_err();
+            assert!(matches!(error, ExportError::Invalid(_)), "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn a_tool_only_another_steam_install_sees_warns() {
+        let home = home();
+        let flatpak = home
+            .env
+            .flatpak_root("com.valvesoftware.Steam")
+            .join(".local/share/Steam");
+        fs::create_dir_all(flatpak.join("userdata/222")).unwrap();
+        let report = run_export(&home.env, &home.work, &request(&home)).unwrap();
+        let flatpak_result = report
+            .results
+            .iter()
+            .find(|result| result.install_id.contains("valvesoftware"))
+            .unwrap();
+        assert!(flatpak_result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("this Steam install")));
+        assert!(report.results[0].warnings.is_empty());
     }
 
     #[test]
@@ -681,6 +950,7 @@ mod tests {
         fs::create_dir_all(marker.parent().unwrap()).unwrap();
         fs::write(&marker, "save").unwrap();
         run_export(&home.env, &home.work, &request).unwrap();
+        request.allow_prefix_change = true;
         request.prefix = home
             .dir
             .path()

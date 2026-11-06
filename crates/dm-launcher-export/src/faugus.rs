@@ -181,6 +181,7 @@ pub(crate) fn read_existing(
         .find(|game| is_game(game, &id))
         .map(|game| ExistingExport {
             install_id: String::new(),
+            steam_user_id: None,
             display_name: text(game, "title"),
             executable: text(game, "path"),
             prefix: text(game, "prefix"),
@@ -211,14 +212,12 @@ mod tests {
     fn spec(home: &Path) -> ExportSpec {
         ExportSpec {
             work_id: "RJ1".to_owned(),
-            work_root: PathBuf::from("/games/RJ1"),
             display_name: "月光".to_owned(),
             executable: "/games/RJ1/Game.exe".to_owned(),
             prefix: "/prefixes/RJ1".to_owned(),
             tool: ResolvedTool {
                 id: "Proton-DL".to_owned(),
                 path: Some(home.join(".local/share/Steam/compatibilitytools.d/proton-dl")),
-                discovered: true,
             },
             cover_url: None,
         }
@@ -247,7 +246,7 @@ mod tests {
 
     fn run(fixture: &Fixture, spec: &ExportSpec) -> Vec<Value> {
         let plan = plan(&fixture.env, &fixture.data, spec).unwrap();
-        commit_all(plan.writes).unwrap();
+        commit_all(plan.writes).map_err(|f| f.error).unwrap();
         serde_json::from_slice(&fs::read(fixture.data.join(GAMES_FILE)).unwrap()).unwrap()
     }
 
@@ -325,6 +324,38 @@ mod tests {
             games[0]["runner"],
             "/usr/share/steam/compatibilitytools.d/x"
         );
+    }
+
+    #[test]
+    fn bare_runner_names_follow_faugus_not_a_custom_xdg_data_home() {
+        let mut fixture = fixture(None);
+        let home = fixture.env.home.clone();
+        fixture.env.data_home = home.join("custom-data");
+        let data = fixture.env.data_home.join("faugus-launcher");
+        fs::create_dir_all(&data).unwrap();
+        fixture.data = data;
+        let mut spec = spec(&home);
+        spec.tool.path = Some(home.join("custom-data/Steam/compatibilitytools.d/x"));
+        let games = run(&fixture, &spec);
+        assert_eq!(
+            games[0]["runner"],
+            home.join("custom-data/Steam/compatibilitytools.d/x")
+                .to_str()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn number_values_survive_a_rewrite() {
+        let fixture = fixture(Some(
+            r#"[{"gameid":"x","a":0.30000000000000004,"b":18446744073709551615,"c":-9007199254740993,"d":1.7976931348623157e308}]"#,
+        ));
+        let games = run(&fixture, &spec(&fixture.env.home));
+        let text = fs::read_to_string(fixture.data.join(GAMES_FILE)).unwrap();
+        assert!(text.contains("0.30000000000000004"), "{text}");
+        assert!(text.contains("18446744073709551615"), "{text}");
+        assert!(text.contains("-9007199254740993"), "{text}");
+        assert_eq!(games[0]["d"].as_f64().unwrap(), f64::MAX);
     }
 
     #[test]

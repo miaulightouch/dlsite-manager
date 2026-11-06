@@ -65,10 +65,11 @@ impl ExportEnv {
         self.home.join(".var/app").join(id)
     }
 
-    /// Faugus resolves runner names against these two folders.
+    /// Faugus resolves runner names against these two folders. It builds the
+    /// first from the home folder, not from `XDG_DATA_HOME`.
     pub(crate) fn faugus_runner_dirs(&self) -> Vec<PathBuf> {
         vec![
-            self.data_home.join("Steam/compatibilitytools.d"),
+            self.home.join(".local/share/Steam/compatibilitytools.d"),
             self.flatpak_root(STEAM_FLATPAK)
                 .join(".local/share/Steam/compatibilitytools.d"),
         ]
@@ -296,14 +297,44 @@ pub fn discover_compat_tools(env: &ExportEnv) -> Vec<CompatTool> {
         .iter()
         .map(|(root, _)| root.join("compatibilitytools.d"))
         .collect();
+    directories.push(env.data_home.join("Steam/compatibilitytools.d"));
     directories.extend(env.faugus_runner_dirs());
-    directories.extend(env.extra_compat_tool_dirs.iter().cloned());
+    directories.extend(system_tool_dirs(env));
+    let libraries: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|(root, _)| steam_libraries(root))
+        .collect();
+    collect_tools(&directories, &libraries)
+}
+
+/// Whether this Steam install itself can see a tool id. A Flatpak Steam does not
+/// read the host's system folders.
+pub(crate) fn steam_can_see_tool(
+    env: &ExportEnv,
+    root: &Path,
+    flavor: InstallFlavor,
+    tool_id: &str,
+) -> bool {
+    let mut directories = vec![root.join("compatibilitytools.d")];
+    if flavor == InstallFlavor::Native {
+        directories.extend(system_tool_dirs(env));
+    }
+    collect_tools(&directories, &steam_libraries(root))
+        .iter()
+        .any(|tool| tool.id == tool_id)
+}
+
+fn system_tool_dirs(env: &ExportEnv) -> Vec<PathBuf> {
+    let mut directories = env.extra_compat_tool_dirs.clone();
     directories.extend(
         env.data_dirs
             .iter()
             .map(|dir| dir.join("steam/compatibilitytools.d")),
     );
+    directories
+}
 
+fn collect_tools(directories: &[PathBuf], libraries: &[PathBuf]) -> Vec<CompatTool> {
     let mut tools: Vec<CompatTool> = Vec::new();
     let mut add = |tool: CompatTool| {
         if !tools.iter().any(|known| known.id == tool.id) {
@@ -311,7 +342,7 @@ pub fn discover_compat_tools(env: &ExportEnv) -> Vec<CompatTool> {
         }
     };
     for directory in directories {
-        let mut entries: Vec<PathBuf> = fs::read_dir(&directory)
+        let mut entries: Vec<PathBuf> = fs::read_dir(directory)
             .into_iter()
             .flatten()
             .flatten()
@@ -323,12 +354,8 @@ pub fn discover_compat_tools(env: &ExportEnv) -> Vec<CompatTool> {
             read_tool_directory(&entry).into_iter().for_each(&mut add);
         }
     }
-    for (root, _) in &roots {
-        for library in steam_libraries(root) {
-            for tool in bundled_proton_tools(&library) {
-                add(tool);
-            }
-        }
+    for library in libraries {
+        bundled_proton_tools(library).into_iter().for_each(&mut add);
     }
     tools
 }
@@ -436,8 +463,6 @@ pub(crate) fn bundled_proton_id(folder: &str) -> Option<String> {
 pub(crate) struct ResolvedTool {
     pub id: String,
     pub path: Option<PathBuf>,
-    /// Found in a folder Steam reads, so a Steam mapping to `id` can work.
-    pub discovered: bool,
 }
 
 /// Interpret the compatibility tool field: a discovered id, display name or
@@ -447,7 +472,6 @@ pub(crate) fn resolve_tool(tools: &[CompatTool], input: &str) -> ResolvedTool {
     let from_tool = |tool: &CompatTool| ResolvedTool {
         id: tool.id.clone(),
         path: tool.path.as_ref().map(PathBuf::from),
-        discovered: true,
     };
     if let Some(tool) = tools.iter().find(|tool| tool.id == input) {
         return from_tool(tool);
@@ -478,13 +502,11 @@ pub(crate) fn resolve_tool(tools: &[CompatTool], input: &str) -> ResolvedTool {
         return ResolvedTool {
             id,
             path: Some(path.to_path_buf()),
-            discovered: false,
         };
     }
     ResolvedTool {
         id: input.to_owned(),
         path: None,
-        discovered: false,
     }
 }
 
@@ -653,6 +675,48 @@ mod tests {
     }
 
     #[test]
+    fn tool_visibility_is_per_steam_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let env = env(home);
+        let native = home.join(".local/share/Steam");
+        let flatpak = home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam");
+        fs::create_dir_all(native.join("userdata/1")).unwrap();
+        fs::create_dir_all(flatpak.join("userdata/2")).unwrap();
+        write(&native.join("compatibilitytools.d/only-native/proton"), "");
+        write(
+            &flatpak.join("compatibilitytools.d/only-flatpak/proton"),
+            "",
+        );
+        write(
+            &home.join("system-share/steam/compatibilitytools.d/system-tool/proton"),
+            "",
+        );
+        write(&flatpak.join("steamapps/common/Proton 10.0/proton"), "");
+
+        let native_sees = |id| steam_can_see_tool(&env, &native, InstallFlavor::Native, id);
+        let flatpak_sees = |id| steam_can_see_tool(&env, &flatpak, InstallFlavor::Flatpak, id);
+        assert!(native_sees("only-native"));
+        assert!(!native_sees("only-flatpak"));
+        assert!(native_sees("system-tool"));
+        assert!(!native_sees("proton_10"));
+        assert!(flatpak_sees("only-flatpak"));
+        assert!(flatpak_sees("proton_10"));
+        assert!(!flatpak_sees("only-native"));
+        assert!(!flatpak_sees("system-tool"));
+    }
+
+    #[test]
+    fn faugus_runner_folders_ignore_a_custom_xdg_data_home() {
+        let mut env = ExportEnv::for_home(PathBuf::from("/home/u"));
+        env.data_home = PathBuf::from("/custom/data");
+        assert_eq!(
+            env.faugus_runner_dirs()[0],
+            PathBuf::from("/home/u/.local/share/Steam/compatibilitytools.d")
+        );
+    }
+
+    #[test]
     fn bundled_ids_follow_steams_naming() {
         for (folder, id) in [
             ("Proton - Experimental", Some("proton_experimental")),
@@ -693,8 +757,7 @@ mod tests {
             resolve_tool(&tools, "unknown_tool"),
             ResolvedTool {
                 id: "unknown_tool".to_owned(),
-                path: None,
-                discovered: false
+                path: None
             }
         );
     }

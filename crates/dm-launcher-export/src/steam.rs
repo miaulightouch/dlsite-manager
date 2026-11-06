@@ -7,6 +7,15 @@ use crate::{ExistingExport, ExportError, ExportSpec, Plan};
 use std::path::{Path, PathBuf};
 
 const PREFIX_VARIABLE: &str = "STEAM_COMPAT_DATA_PATH";
+/// Marks a shortcut as created by this app for one work. Launch options are the
+/// one field Steam must keep verbatim, and the prefix already depends on them.
+const MARKER_VARIABLE: &str = "DLSITE_MANAGER_WORK";
+/// Shell builtins that cannot run `%command%` with the assignments before them.
+const NON_WRAPPER_WORDS: &[&str] = &[
+    "alias", "cd", "declare", "eval", "export", "local", "readonly", "set", "source", "unset", ".",
+];
+/// Characters a shell may expand inside the double quotes around `Exe`.
+const UNSAFE_EXE_CHARACTERS: &[char] = &['"', '$', '`', '\\'];
 const MAPPING_PATH: [&str; 5] = [
     "InstallConfigStore",
     "Software",
@@ -54,14 +63,19 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-/// A work's folder belongs to one work, so any shortcut into it is that work's.
-fn is_work_entry(entry: &Map, work_root: &Path) -> bool {
-    entry
-        .get_string("Exe")
-        .is_some_and(|exe| Path::new(unquote(&exe)).starts_with(work_root))
+fn launch_options_text(entry: &Map) -> String {
+    entry.get_string("LaunchOptions").unwrap_or_default()
 }
 
-fn upsert_shortcut(root: &mut Map, spec: &ExportSpec) -> (u32, bool, usize) {
+/// Only shortcuts this app marked for this work count as that work's, so a
+/// hand-added shortcut or a nested work's shortcut is never rewritten.
+fn is_work_entry(entry: &Map, work_id: &str) -> bool {
+    let marker = format!("{MARKER_VARIABLE}={work_id}");
+    shell_words(&launch_options_text(entry)).contains(&marker.as_str())
+}
+
+/// `Ok((appid, created, marked entries))`
+fn upsert_shortcut(root: &mut Map, spec: &ExportSpec) -> Result<(u32, bool, usize), ExportError> {
     let exe = format!("\"{}\"", spec.executable);
     let start_dir = Path::new(&spec.executable)
         .parent()
@@ -80,7 +94,7 @@ fn upsert_shortcut(root: &mut Map, spec: &ExportSpec) -> (u32, bool, usize) {
         .iter()
         .enumerate()
         .filter_map(|(index, (_, value))| match value {
-            Value::Map(entry) if is_work_entry(entry, &spec.work_root) => Some(index),
+            Value::Map(entry) if is_work_entry(entry, &spec.work_id) => Some(index),
             _ => None,
         })
         .collect();
@@ -89,6 +103,22 @@ fn upsert_shortcut(root: &mut Map, spec: &ExportSpec) -> (u32, bool, usize) {
         let Value::Map(entry) = &mut shortcuts.0[index].1 else {
             unreachable!("matches only holds map entries");
         };
+        if let Some(Value::String(bytes)) = entry.get("LaunchOptions") {
+            if std::str::from_utf8(bytes).is_err() {
+                return Err(ExportError::Refused(
+                    "this work's Steam launch options are not valid UTF-8 and cannot be updated without changing them"
+                        .to_owned(),
+                ));
+            }
+        }
+        let options =
+            merge_launch_options(&launch_options_text(entry), &spec.work_id, &spec.prefix)
+                .ok_or_else(|| {
+                    ExportError::Refused(
+                        "this work's Steam launch options are too complex to set the Wine prefix safely; simplify them to environment variables, wrappers, %command% and arguments, then export again"
+                            .to_owned(),
+                    )
+                })?;
         let appid = match entry.get("appid") {
             Some(Value::Int32(appid)) if *appid != 0 => *appid,
             _ => {
@@ -97,10 +127,6 @@ fn upsert_shortcut(root: &mut Map, spec: &ExportSpec) -> (u32, bool, usize) {
                 appid
             }
         };
-        let options = merge_launch_options(
-            &entry.get_string("LaunchOptions").unwrap_or_default(),
-            &spec.prefix,
-        );
         for (key, value) in [
             ("AppName", spec.display_name.as_str()),
             ("Exe", exe.as_str()),
@@ -109,16 +135,27 @@ fn upsert_shortcut(root: &mut Map, spec: &ExportSpec) -> (u32, bool, usize) {
         ] {
             entry.set(key, Value::String(value.as_bytes().to_vec()));
         }
-        return (appid, false, matches.len());
+        return Ok((appid, false, matches.len()));
     }
 
+    let appid = shortcut_appid(&exe, &spec.display_name);
+    let collides = shortcuts.0.iter().any(|(_, value)| {
+        matches!(value, Value::Map(entry) if entry.get("appid") == Some(&Value::Int32(appid)))
+    });
+    if collides {
+        return Err(ExportError::Refused(format!(
+            "Steam already has a shortcut for this executable named \"{}\" that this app did not create; rename or remove it, or export under another name",
+            spec.display_name
+        )));
+    }
     let next_index = shortcuts
         .0
         .iter()
         .filter_map(|(key, _)| std::str::from_utf8(key).ok()?.parse::<u64>().ok())
         .max()
         .map_or(0, |max| max + 1);
-    let appid = shortcut_appid(&exe, &spec.display_name);
+    let options = merge_launch_options("", &spec.work_id, &spec.prefix)
+        .expect("empty launch options are always simple");
     let text = |value: &str| Value::String(value.as_bytes().to_vec());
     let entry = Map(vec![
         (b"appid".to_vec(), Value::Int32(appid)),
@@ -127,10 +164,7 @@ fn upsert_shortcut(root: &mut Map, spec: &ExportSpec) -> (u32, bool, usize) {
         (b"StartDir".to_vec(), text(&start_dir)),
         (b"icon".to_vec(), text("")),
         (b"ShortcutPath".to_vec(), text("")),
-        (
-            b"LaunchOptions".to_vec(),
-            text(&merge_launch_options("", &spec.prefix)),
-        ),
+        (b"LaunchOptions".to_vec(), text(&options)),
         (b"IsHidden".to_vec(), Value::Int32(0)),
         (b"AllowDesktopConfig".to_vec(), Value::Int32(1)),
         (b"AllowOverlay".to_vec(), Value::Int32(1)),
@@ -145,7 +179,7 @@ fn upsert_shortcut(root: &mut Map, spec: &ExportSpec) -> (u32, bool, usize) {
     shortcuts
         .0
         .push((next_index.to_string().into_bytes(), Value::Map(entry)));
-    (appid, true, 0)
+    Ok((appid, true, 0))
 }
 
 /// Split shell-like words, keeping each word's source text and quotes.
@@ -195,21 +229,82 @@ fn is_prefix_assignment(word: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('='))
 }
 
-/// Point Proton at the work's prefix while keeping the user's other options.
-pub(crate) fn merge_launch_options(existing: &str, prefix: &str) -> String {
-    let words: Vec<&str> = shell_words(existing)
-        .into_iter()
-        .filter(|word| !is_prefix_assignment(word))
-        .collect();
-    let mut merged = format!("{PREFIX_VARIABLE}={}", shell_quote(prefix));
-    if !words.contains(&"%command%") {
-        merged.push_str(" %command%");
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// True when text has syntax outside quotes that makes it more than one simple
+/// command, or a substitution anywhere a shell would run it.
+fn has_compound_syntax(text: &str) -> bool {
+    let mut quote = None;
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match (quote, character) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => {
+                characters.next();
+            }
+            (_, '`') => return true,
+            (_, '$') if characters.peek() == Some(&'(') => return true,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(character),
+            (None, ';' | '&' | '|' | '<' | '>' | '(' | ')' | '{' | '}' | '\n' | '#') => {
+                return true
+            }
+            (None, _) => {}
+        }
     }
-    for word in words {
-        merged.push(' ');
-        merged.push_str(word);
+    false
+}
+
+/// Point Proton at the work's prefix and mark the shortcut, keeping the user's
+/// other options. `None` when the options are not one simple command, because
+/// an assignment in front of them might not reach the game.
+pub(crate) fn merge_launch_options(existing: &str, work_id: &str, prefix: &str) -> Option<String> {
+    if has_compound_syntax(existing) {
+        return None;
     }
-    merged
+    let words = shell_words(existing);
+    let command_count = words.iter().filter(|word| **word == "%command%").count();
+    if command_count > 1 || (command_count == 0 && existing.contains("%command%")) {
+        return None;
+    }
+    let (before, arguments) = match words.iter().position(|word| *word == "%command%") {
+        Some(position) => (&words[..position], &words[position + 1..]),
+        None => (&words[..0], &words[..]),
+    };
+    let assignments = before.iter().take_while(|word| is_assignment(word)).count();
+    let (environment, wrappers) = before.split_at(assignments);
+    if wrappers
+        .iter()
+        .any(|word| word.contains(PREFIX_VARIABLE) || NON_WRAPPER_WORDS.contains(word))
+    {
+        return None;
+    }
+
+    let mut merged = vec![
+        format!("{PREFIX_VARIABLE}={}", shell_quote(prefix)),
+        format!("{MARKER_VARIABLE}={work_id}"),
+    ];
+    let marker = format!("{MARKER_VARIABLE}=");
+    merged.extend(
+        environment
+            .iter()
+            .filter(|word| !is_prefix_assignment(word) && !word.starts_with(&marker))
+            .map(|word| (*word).to_owned()),
+    );
+    merged.extend(wrappers.iter().map(|word| (*word).to_owned()));
+    merged.push("%command%".to_owned());
+    merged.extend(arguments.iter().map(|word| (*word).to_owned()));
+    Some(merged.join(" "))
 }
 
 fn prefix_from_launch_options(options: &str) -> Option<String> {
@@ -239,30 +334,32 @@ pub(crate) fn set_compat_mapping(text: &str, appid: u32, tool: &str) -> Result<S
         return Ok(render_missing(&MAPPING_PATH, 0, &appid_key, tool));
     }
     let nodes = vdf_text::parse(text)?;
-    if vdf_text::find(&nodes, MAPPING_PATH[0]).is_none() {
+    let chain = mapping_chain(&nodes)?;
+    if chain.is_empty() {
         return Err(format!("the {} section is missing", MAPPING_PATH[0]));
     }
-
-    let mut level = nodes.as_slice();
-    let mut deepest_close = None;
-    for (depth, name) in MAPPING_PATH.iter().enumerate() {
-        match vdf_text::find(level, name).map(|node| &node.body) {
-            Some(Body::Block { children, close }) => {
-                level = children;
-                deepest_close = Some((*close, depth));
-            }
-            Some(Body::Value { .. }) => return Err(format!("{name} is not a section")),
-            None => {
-                let (close, parent_depth) =
-                    deepest_close.expect("the root section was found above");
-                let rendered =
-                    render_missing(&MAPPING_PATH[depth..], parent_depth + 1, &appid_key, tool);
-                return Ok(splice_into_block(text, close, rendered));
-            }
-        }
+    let deepest = chain[chain.len() - 1];
+    let Body::Block { children, close } = &deepest.body else {
+        return Err(format!("{} is not a section", deepest.key));
+    };
+    let parent_depth = chain.len() - 1;
+    if chain.len() < MAPPING_PATH.len() {
+        let rendered = render_missing(
+            &MAPPING_PATH[chain.len()..],
+            parent_depth + 1,
+            &appid_key,
+            tool,
+        );
+        return Ok(splice_into_block(text, *close, rendered));
     }
-
-    let (mapping_close, mapping_depth) = deepest_close.expect("the full path was walked");
+    let (level, mapping_close, mapping_depth) = (children.as_slice(), *close, parent_depth);
+    let same_key = level
+        .iter()
+        .filter(|node| node.key.eq_ignore_ascii_case(&appid_key))
+        .count();
+    if same_key > 1 {
+        return Err(format!("mapping {appid_key} appears more than once"));
+    }
     let updated = match vdf_text::find(level, &appid_key).map(|node| &node.body) {
         None => splice_into_block(
             text,
@@ -289,6 +386,43 @@ pub(crate) fn set_compat_mapping(text: &str, appid: u32, tool: &str) -> Result<S
         }
     };
     Ok(updated)
+}
+
+/// The deepest run of sections leading to the mapping. Section names can occur
+/// twice with different case ("Valve" and "valve"); the fullest one wins, and a
+/// tie is refused, because which one Steam reads is not known.
+fn mapping_chain(nodes: &[vdf_text::Node]) -> Result<Vec<&vdf_text::Node>, String> {
+    fn walk<'a>(level: &'a [vdf_text::Node], path: &[&str]) -> Vec<Vec<&'a vdf_text::Node>> {
+        let Some((name, rest)) = path.split_first() else {
+            return vec![Vec::new()];
+        };
+        let mut chains = Vec::new();
+        for node in level
+            .iter()
+            .filter(|node| node.key.eq_ignore_ascii_case(name))
+        {
+            for tail in walk(node.children(), rest) {
+                let mut chain = vec![node];
+                chain.extend(tail);
+                chains.push(chain);
+            }
+        }
+        if chains.is_empty() {
+            chains.push(Vec::new());
+        }
+        chains
+    }
+    let chains = walk(nodes, &MAPPING_PATH);
+    let longest = chains.iter().map(Vec::len).max().unwrap_or(0);
+    let mut fullest = chains.into_iter().filter(|chain| chain.len() == longest);
+    let chain = fullest.next().unwrap_or_default();
+    if fullest.next().is_some() {
+        return Err(format!(
+            "duplicate \"{}\" sections make the tool mapping ambiguous",
+            MAPPING_PATH[longest.saturating_sub(1)]
+        ));
+    }
+    Ok(chain)
 }
 
 fn render_entry(depth: usize, appid: &str, tool: &str) -> String {
@@ -324,8 +458,11 @@ fn splice_into_block(text: &str, close: usize, rendered: String) -> String {
 
 fn lookup_mapping(text: &str, appid: u32) -> Option<String> {
     let nodes = vdf_text::parse(text).ok()?;
-    let mapping = vdf_text::find_path(&nodes, &MAPPING_PATH)?;
-    let entry = vdf_text::find(mapping.children(), &appid.to_string())?;
+    let chain = mapping_chain(&nodes).ok()?;
+    if chain.len() != MAPPING_PATH.len() {
+        return None;
+    }
+    let entry = vdf_text::find(chain[chain.len() - 1].children(), &appid.to_string())?;
     Some(
         vdf_text::find(entry.children(), "name")?
             .value()?
@@ -333,10 +470,17 @@ fn lookup_mapping(text: &str, appid: u32) -> Option<String> {
     )
 }
 
-pub(crate) fn plan(root: &Path, users: &[String], spec: &ExportSpec) -> Result<Plan, ExportError> {
-    if spec.executable.contains('"') {
+pub(crate) fn plan(
+    root: &Path,
+    users: &[String],
+    spec: &ExportSpec,
+    tool_visible: bool,
+) -> Result<Plan, ExportError> {
+    // Steam starts shortcuts through a shell, and Exe sits in double quotes there.
+    if spec.executable.contains(UNSAFE_EXE_CHARACTERS) {
         return Err(ExportError::Invalid(
-            "Steam shortcuts cannot use an executable path containing a double quote".to_owned(),
+            "Steam shortcuts cannot use an executable path containing \", $, ` or \\; rename the folder or file"
+                .to_owned(),
         ));
     }
     let mut writes = Vec::new();
@@ -347,11 +491,11 @@ pub(crate) fn plan(root: &Path, users: &[String], spec: &ExportSpec) -> Result<P
         let path = shortcuts_path(root, user);
         let original = read_optional(&path)?;
         let mut document = parse_shortcuts(&path, original.as_deref().unwrap_or_default())?;
-        let (appid, new_entry, match_count) = upsert_shortcut(&mut document, spec);
+        let (appid, new_entry, match_count) = upsert_shortcut(&mut document, spec)?;
         created |= new_entry;
         if match_count > 1 {
             warnings.push(format!(
-                "Steam user {user} has {match_count} shortcuts into this work's folder; only the first was updated"
+                "Steam user {user} has {match_count} shortcuts for this work; only the first was updated"
             ));
         }
         if !appids.contains(&appid) {
@@ -388,7 +532,7 @@ pub(crate) fn plan(root: &Path, users: &[String], spec: &ExportSpec) -> Result<P
         contents: config.into_bytes(),
     });
 
-    if !spec.tool.discovered {
+    if !tool_visible {
         warnings.push(unknown_tool_warning(&spec.tool));
     }
     Ok(Plan {
@@ -400,7 +544,7 @@ pub(crate) fn plan(root: &Path, users: &[String], spec: &ExportSpec) -> Result<P
 
 fn unknown_tool_warning(tool: &ResolvedTool) -> String {
     format!(
-        "\"{}\" was not found in Steam's tool folders; Steam ignores a mapping to a tool it does not know",
+        "\"{}\" was not found in the folders this Steam install reads; Steam ignores a mapping to a tool it does not know",
         tool.id
     )
 }
@@ -409,7 +553,7 @@ fn unknown_tool_warning(tool: &ResolvedTool) -> String {
 pub(crate) fn read_existing(
     root: &Path,
     users: &[String],
-    work_root: &Path,
+    work_id: &str,
 ) -> Result<Vec<ExistingExport>, ExportError> {
     let config = read_optional(&root.join("config/config.vdf"))?
         .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -426,7 +570,7 @@ pub(crate) fn read_existing(
         };
         for (_, value) in &shortcuts.0 {
             let Value::Map(entry) = value else { continue };
-            if !is_work_entry(entry, work_root) {
+            if !is_work_entry(entry, work_id) {
                 continue;
             }
             let appid = match entry.get("appid") {
@@ -435,6 +579,7 @@ pub(crate) fn read_existing(
             };
             found.push(ExistingExport {
                 install_id: String::new(),
+                steam_user_id: Some(user.clone()),
                 display_name: entry.get_string("AppName"),
                 executable: entry.get_string("Exe").map(|exe| unquote(&exe).to_owned()),
                 prefix: entry
@@ -458,14 +603,12 @@ mod tests {
     fn spec(name: &str) -> ExportSpec {
         ExportSpec {
             work_id: "RJ1".to_owned(),
-            work_root: PathBuf::from(WORK_ROOT),
             display_name: name.to_owned(),
             executable: format!("{WORK_ROOT}/Game.exe"),
             prefix: "/prefixes/RJ1".to_owned(),
             tool: ResolvedTool {
                 id: "Proton-DL".to_owned(),
                 path: Some(PathBuf::from("/tools/proton-dl")),
-                discovered: true,
             },
             cover_url: None,
         }
@@ -519,7 +662,7 @@ mod tests {
     fn adding_keeps_every_existing_entry_and_uses_the_next_index() {
         let mut document = parse_shortcuts(Path::new("x"), &existing_shortcuts()).unwrap();
         let before = document.clone();
-        let (appid, created, _) = upsert_shortcut(&mut document, &spec("月光"));
+        let (appid, created, _) = upsert_shortcut(&mut document, &spec("月光")).unwrap();
         assert!(created);
         assert_eq!(
             appid,
@@ -549,7 +692,7 @@ mod tests {
         );
         assert_eq!(
             entry.get_string("LaunchOptions").unwrap(),
-            "STEAM_COMPAT_DATA_PATH='/prefixes/RJ1' %command%"
+            "STEAM_COMPAT_DATA_PATH='/prefixes/RJ1' DLSITE_MANAGER_WORK=RJ1 %command%"
         );
 
         let reparsed = vdf_binary::parse(&vdf_binary::serialize(&document)).unwrap();
@@ -559,7 +702,7 @@ mod tests {
     #[test]
     fn reexport_updates_in_place_and_keeps_appid_and_user_fields() {
         let mut document = parse_shortcuts(Path::new("x"), &existing_shortcuts()).unwrap();
-        let (appid, _, _) = upsert_shortcut(&mut document, &spec("Name"));
+        let (appid, _, _) = upsert_shortcut(&mut document, &spec("Name")).unwrap();
         {
             let Some(Value::Map(shortcuts)) = document.get_mut("shortcuts") else {
                 panic!();
@@ -570,12 +713,15 @@ mod tests {
             entry.set("LastPlayTime", Value::Int32(99));
             entry.set(
                 "LaunchOptions",
-                Value::String(b"MANGOHUD=1 STEAM_COMPAT_DATA_PATH=/old %command% -w".to_vec()),
+                Value::String(
+                    b"MANGOHUD=1 STEAM_COMPAT_DATA_PATH=/old DLSITE_MANAGER_WORK=RJ1 %command% -w"
+                        .to_vec(),
+                ),
             );
         }
         let mut changed = spec("Renamed");
         changed.executable = format!("{WORK_ROOT}/bin/Other.exe");
-        let (same_appid, created, _) = upsert_shortcut(&mut document, &changed);
+        let (same_appid, created, _) = upsert_shortcut(&mut document, &changed).unwrap();
         assert!(!created);
         assert_eq!(same_appid, appid);
         let Some(Value::Map(shortcuts)) = document.get("shortcuts") else {
@@ -593,19 +739,106 @@ mod tests {
         );
         assert_eq!(
             entry.get_string("LaunchOptions").unwrap(),
-            "STEAM_COMPAT_DATA_PATH='/prefixes/RJ1' MANGOHUD=1 %command% -w"
+            "STEAM_COMPAT_DATA_PATH='/prefixes/RJ1' DLSITE_MANAGER_WORK=RJ1 MANGOHUD=1 %command% -w"
         );
     }
 
+    fn hand_added_entry(exe: &str, name: &str, options: &[u8]) -> Value {
+        Value::Map(Map(vec![
+            (b"appid".to_vec(), Value::Int32(shortcut_appid(exe, name))),
+            (b"AppName".to_vec(), Value::String(name.as_bytes().to_vec())),
+            (b"Exe".to_vec(), Value::String(exe.as_bytes().to_vec())),
+            (b"LaunchOptions".to_vec(), Value::String(options.to_vec())),
+        ]))
+    }
+
+    fn entries(document: &Map) -> &Map {
+        let Some(Value::Map(shortcuts)) = document.get("shortcuts") else {
+            panic!("missing shortcuts");
+        };
+        shortcuts
+    }
+
+    fn document_with(entry: Value) -> Map {
+        Map(vec![(
+            b"shortcuts".to_vec(),
+            Value::Map(Map(vec![(b"0".to_vec(), entry)])),
+        )])
+    }
+
     #[test]
-    fn a_folder_with_a_similar_name_is_not_the_same_work() {
-        let mut document = parse_shortcuts(Path::new("x"), &existing_shortcuts()).unwrap();
-        let mut sibling = spec("Sibling");
-        sibling.work_root = PathBuf::from("/games/RJ12");
-        sibling.executable = "/games/RJ12/Game.exe".to_owned();
-        upsert_shortcut(&mut document, &sibling);
-        let (_, created, _) = upsert_shortcut(&mut document, &spec("First"));
+    fn a_hand_added_shortcut_in_the_work_folder_is_left_alone() {
+        let hand_added = hand_added_entry(
+            &format!("\"{WORK_ROOT}/Game.exe\""),
+            "My Own Name",
+            b"-windowed",
+        );
+        let mut document = document_with(hand_added.clone());
+        let (_, created, _) = upsert_shortcut(&mut document, &spec("Exported")).unwrap();
         assert!(created);
+        assert_eq!(entries(&document).0.len(), 2);
+        assert_eq!(entries(&document).0[0].1, hand_added);
+    }
+
+    #[test]
+    fn a_nested_works_shortcut_is_not_taken_over() {
+        let mut outer = spec("Outer");
+        outer.work_id = "RJ1".to_owned();
+        outer.executable = "/lib/Series/Outer.exe".to_owned();
+        let mut nested = spec("Nested");
+        nested.work_id = "RJ2".to_owned();
+        nested.executable = "/lib/Series/RJ2/Nested.exe".to_owned();
+
+        let mut document = Map::default();
+        upsert_shortcut(&mut document, &nested).unwrap();
+        let before = entries(&document).0[0].1.clone();
+        let (_, created, _) = upsert_shortcut(&mut document, &outer).unwrap();
+        assert!(created);
+        assert_eq!(entries(&document).0[0].1, before);
+
+        // A work id that merely starts with another is a different marker.
+        let mut longer = spec("Longer");
+        longer.work_id = "RJ12".to_owned();
+        longer.executable = format!("{WORK_ROOT}/Longer.exe");
+        let (_, created, _) = upsert_shortcut(&mut document, &longer).unwrap();
+        assert!(created);
+    }
+
+    #[test]
+    fn a_same_name_hand_added_shortcut_is_refused_instead_of_duplicating_its_appid() {
+        let exe = format!("\"{WORK_ROOT}/Game.exe\"");
+        let hand_added = hand_added_entry(&exe, "Title", b"");
+        let mut document = document_with(hand_added.clone());
+        assert!(matches!(
+            upsert_shortcut(&mut document, &spec("Title")),
+            Err(ExportError::Refused(_))
+        ));
+        assert_eq!(entries(&document).0[0].1, hand_added);
+    }
+
+    #[test]
+    fn non_utf8_launch_options_are_refused_and_kept() {
+        let mut options = b"DLSITE_MANAGER_WORK=RJ1 %command% -name=".to_vec();
+        options.push(0xff);
+        let entry = hand_added_entry("\"/x.exe\"", "X", &options);
+        let mut document = document_with(entry.clone());
+        assert!(matches!(
+            upsert_shortcut(&mut document, &spec("Title")),
+            Err(ExportError::Refused(_))
+        ));
+        assert_eq!(entries(&document).0[0].1, entry);
+    }
+
+    #[test]
+    fn compound_launch_options_on_our_shortcut_are_refused_and_kept() {
+        let options = b"cd /x; DLSITE_MANAGER_WORK=RJ1 %command%";
+        let entry = hand_added_entry("\"/x.exe\"", "X", options);
+        let mut document = document_with(entry.clone());
+        assert!(matches!(
+            upsert_shortcut(&mut document, &spec("Title")),
+            Err(ExportError::Refused(_))
+        ));
+        assert_eq!(entries(&document).0[0].1, entry);
     }
 
     #[test]
@@ -619,24 +852,107 @@ mod tests {
     }
 
     #[test]
-    fn launch_options_merge_handles_quotes_and_repeats() {
-        let once = merge_launch_options("", "/p/it's here");
-        assert_eq!(once, "STEAM_COMPAT_DATA_PATH='/p/it'\\''s here' %command%");
-        assert_eq!(merge_launch_options(&once, "/p/it's here"), once);
-        assert_eq!(prefix_from_launch_options(&once).unwrap(), "/p/it's here");
+    fn launch_options_merge_handles_simple_commands_and_repeats() {
+        let merge = |text: &str| merge_launch_options(text, "RJ1", "/p");
+        let head = "STEAM_COMPAT_DATA_PATH='/p' DLSITE_MANAGER_WORK=RJ1";
+
+        let once = merge_launch_options("", "RJ1", "/p/it's here").unwrap();
         assert_eq!(
-            merge_launch_options("-windowed", "/p"),
-            "STEAM_COMPAT_DATA_PATH='/p' %command% -windowed"
+            once,
+            "STEAM_COMPAT_DATA_PATH='/p/it'\\''s here' DLSITE_MANAGER_WORK=RJ1 %command%"
         );
         assert_eq!(
-            merge_launch_options("FOO=\"a b\" gamemoderun %command%", "/p"),
-            "STEAM_COMPAT_DATA_PATH='/p' FOO=\"a b\" gamemoderun %command%"
+            merge_launch_options(&once, "RJ1", "/p/it's here").unwrap(),
+            once
+        );
+        assert_eq!(prefix_from_launch_options(&once).unwrap(), "/p/it's here");
+
+        assert_eq!(
+            merge("-windowed").unwrap(),
+            format!("{head} %command% -windowed")
+        );
+        assert_eq!(
+            merge("FOO=\"a b\" gamemoderun %command%").unwrap(),
+            format!("{head} FOO=\"a b\" gamemoderun %command%")
+        );
+        assert_eq!(
+            merge("STEAM_COMPAT_DATA_PATH=/old mangohud %command% --x='a;b'").unwrap(),
+            format!("{head} mangohud %command% --x='a;b'")
         );
         assert_eq!(
             prefix_from_launch_options("STEAM_COMPAT_DATA_PATH=\"/a b\" %command%").unwrap(),
             "/a b"
         );
         assert_eq!(prefix_from_launch_options("%command%"), None);
+    }
+
+    #[test]
+    fn launch_options_a_prefix_would_not_reach_are_refused() {
+        for options in [
+            "cd /x; %command%",
+            "cd /x && %command%",
+            "sh -c \"exec %command%\"",
+            "\"%command%\"",
+            "export STEAM_COMPAT_DATA_PATH=/x; %command%",
+            "export %command%",
+            "env STEAM_COMPAT_DATA_PATH=/x %command%",
+            "%command% %command%",
+            "foo | %command%",
+            "%command% > /tmp/log",
+            "A=$(date) %command%",
+            "A=`date` %command%",
+            "A=\"$(date)\" %command%",
+            "%command% & wait",
+            "line1\n%command%",
+            "{ %command%; }",
+        ] {
+            assert_eq!(
+                merge_launch_options(options, "RJ1", "/p"),
+                None,
+                "{options}"
+            );
+        }
+    }
+
+    #[test]
+    fn exe_paths_a_shell_would_expand_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = steam_fixture(dir.path());
+        for name in ["a$b", "a`b", "a\"b", "a\\b"] {
+            let mut bad = spec("Title");
+            bad.executable = format!("{WORK_ROOT}/{name}.exe");
+            assert!(
+                matches!(
+                    plan(&root, &["111".to_owned()], &bad, true),
+                    Err(ExportError::Invalid(_))
+                ),
+                "{name}"
+            );
+        }
+        let mut quote = spec("Title");
+        quote.executable = format!("{WORK_ROOT}/Let's Play.exe");
+        assert!(plan(&root, &["111".to_owned()], &quote, true).is_ok());
+    }
+
+    #[test]
+    fn duplicate_case_sections_use_the_one_with_the_mapping_or_refuse() {
+        let body = |inner: &str| {
+            format!("\"InstallConfigStore\"\n{{\n\t\"Software\"\n\t{{\n{inner}\t}}\n}}\n")
+        };
+        let empty_valve = "\t\t\"valve\"\n\t\t{\n\t\t}\n";
+        let mapped = "\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"CompatToolMapping\"\n\t\t\t\t{\n\t\t\t\t}\n\t\t\t}\n\t\t}\n";
+
+        let text = body(&format!("{empty_valve}{mapped}"));
+        let updated = set_compat_mapping(&text, 5, "T").unwrap();
+        assert_eq!(lookup_mapping(&updated, 5).unwrap(), "T");
+        assert!(updated.contains(empty_valve));
+        assert!(updated.find("\"5\"").unwrap() > updated.find("CompatToolMapping").unwrap());
+
+        let ambiguous = body(&format!("{mapped}{}", mapped.replace("Valve", "valve")));
+        assert!(set_compat_mapping(&ambiguous, 5, "T")
+            .unwrap_err()
+            .contains("ambiguous"));
+        assert_eq!(lookup_mapping(&ambiguous, 5), None);
     }
 
     #[test]
@@ -715,12 +1031,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = steam_fixture(dir.path());
         let users = vec!["111".to_owned(), "222".to_owned()];
-        let plan_result = plan(&root, &users, &spec("Title")).unwrap();
+        let plan_result = plan(&root, &users, &spec("Title"), true).unwrap();
+        assert!(plan_result.warnings.is_empty());
         assert!(plan_result.created);
         assert_eq!(plan_result.writes.len(), 3);
         crate::fsio::commit_all(plan_result.writes).unwrap();
 
-        let existing = read_existing(&root, &users, Path::new(WORK_ROOT)).unwrap();
+        let existing = read_existing(&root, &users, "RJ1").unwrap();
         assert_eq!(existing.len(), 2);
         for found in existing {
             assert_eq!(found.display_name.as_deref(), Some("Title"));
@@ -728,7 +1045,7 @@ mod tests {
             assert_eq!(found.compat_tool.as_deref(), Some("Proton-DL"));
         }
 
-        let again = plan(&root, &users, &spec("Title")).unwrap();
+        let again = plan(&root, &users, &spec("Title"), true).unwrap();
         assert!(!again.created);
         for write in again.writes {
             assert_eq!(write.original.as_deref(), Some(write.contents.as_slice()));
@@ -744,7 +1061,7 @@ mod tests {
         let config_before = fs::read(root.join("config/config.vdf")).unwrap();
         let users = vec!["222".to_owned(), "111".to_owned()];
         assert!(matches!(
-            plan(&root, &users, &spec("Title")),
+            plan(&root, &users, &spec("Title"), true),
             Err(ExportError::Corrupt { .. })
         ));
         assert_eq!(fs::read(&shortcuts).unwrap(), b"corrupted");
@@ -756,14 +1073,11 @@ mod tests {
     }
 
     #[test]
-    fn a_double_quote_in_the_executable_path_is_refused() {
+    fn a_tool_this_install_cannot_see_warns() {
         let dir = tempfile::tempdir().unwrap();
         let root = steam_fixture(dir.path());
-        let mut bad = spec("Title");
-        bad.executable = format!("{WORK_ROOT}/a\"b.exe");
-        assert!(matches!(
-            plan(&root, &["111".to_owned()], &bad),
-            Err(ExportError::Invalid(_))
-        ));
+        let plan = plan(&root, &["111".to_owned()], &spec("Title"), false).unwrap();
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("this Steam install"));
     }
 }

@@ -6,6 +6,8 @@ import {
   initialLauncherExportForm,
   launcherExportBlockers,
   launcherLabel,
+  prefixMoves,
+  runningLauncherLabels,
 } from "./launcher-export";
 
 const options: LauncherExportOptions = {
@@ -66,6 +68,7 @@ describe("launcher export form", () => {
       existing: [
         {
           installId: "heroic:/h",
+          steamUserId: null,
           displayName: "Renamed",
           executable: "/lib/RJ1/Other.exe",
           prefix: "/custom/prefix",
@@ -90,6 +93,7 @@ describe("launcher export form", () => {
       existing: [
         {
           installId: "heroic:/h",
+          steamUserId: null,
           displayName: null,
           executable: "/gone.exe",
           prefix: null,
@@ -116,7 +120,82 @@ describe("launcher export form", () => {
     expect(buildLauncherExportRequest(form, noTools).compatTool).toBe("proton_9");
   });
 
-  it("requires confirmation only when a selected Steam is running", () => {
+  it("asks again after the backend reports a launcher that started later", () => {
+    const form = initialLauncherExportForm(options);
+    form.selected["heroic:/h"] = true;
+    expect(runningLauncherLabels(form, options)).toEqual([]);
+    const report = {
+      prefix: form.prefix,
+      results: [
+        {
+          installId: "heroic:/h",
+          launcher: "heroic" as const,
+          status: "failed" as const,
+          files: [],
+          warnings: [],
+          error: "running",
+          needsAcknowledgement: true,
+          needsPrefixChange: false,
+        },
+      ],
+    };
+    expect(runningLauncherLabels(form, options, report)).toEqual([
+      "Heroic (Flatpak)",
+    ]);
+    expect(launcherExportBlockers(form, options, report)).toHaveLength(1);
+    form.acknowledgeRunning = true;
+    expect(launcherExportBlockers(form, options, report)).toEqual([]);
+  });
+
+  it("never moves a launcher to another prefix without confirmation", () => {
+    const exported = {
+      ...options,
+      existing: [
+        {
+          installId: "steam:/s",
+          steamUserId: "1",
+          displayName: "Steam name",
+          executable: null,
+          prefix: "/steam/prefix",
+          compatTool: null,
+        },
+        {
+          installId: "heroic:/h",
+          steamUserId: null,
+          displayName: "Heroic name",
+          executable: null,
+          prefix: "/heroic/prefix",
+          compatTool: null,
+        },
+      ],
+    };
+    const form = initialLauncherExportForm(exported);
+    expect(form.prefix).toBe("/steam/prefix");
+    expect(form.selected).toEqual({ "steam:/s": true, "heroic:/h": true });
+    expect(prefixMoves(form, exported)).toEqual([
+      { label: "Heroic (Flatpak)", from: "/heroic/prefix" },
+    ]);
+    expect(launcherExportBlockers(form, exported)).toEqual([
+      "Keep the current Wine prefix or confirm moving to the new one.",
+    ]);
+    expect(buildLauncherExportRequest(form, exported).allowPrefixChange).toBe(false);
+
+    form.selected["heroic:/h"] = false;
+    expect(launcherExportBlockers(form, exported)).toEqual([]);
+
+    form.selected["heroic:/h"] = true;
+    form.allowPrefixChange = true;
+    expect(launcherExportBlockers(form, exported)).toEqual([]);
+    expect(buildLauncherExportRequest(form, exported).allowPrefixChange).toBe(true);
+
+    form.steamUsers["steam:/s"] = ["2"];
+    form.prefix = "/other";
+    expect(prefixMoves(form, exported).map((move) => move.label)).toEqual([
+      "Heroic (Flatpak)",
+    ]);
+  });
+
+  it("requires confirmation only when a selected launcher is running", () => {
     const running = {
       ...options,
       installs: options.installs.map((install) =>
@@ -128,7 +207,7 @@ describe("launcher export form", () => {
     expect(launcherExportBlockers(form, running)).toEqual([]);
     form.selected["steam:/s"] = true;
     expect(launcherExportBlockers(form, running)).toHaveLength(1);
-    form.acknowledgeSteamRunning = true;
+    form.acknowledgeRunning = true;
     expect(launcherExportBlockers(form, running)).toEqual([]);
   });
 
@@ -143,7 +222,8 @@ describe("launcher export form", () => {
       compatTool: "Proton-DL",
       prefix: options.defaultPrefix,
       targets: [{ installId: "steam:/s", steamUserIds: ["2"] }],
-      acknowledgeSteamRunning: false,
+      acknowledgeRunning: false,
+      allowPrefixChange: false,
     });
     form.steamUsers["steam:/s"] = [];
     expect(launcherExportBlockers(form, options)).toEqual([

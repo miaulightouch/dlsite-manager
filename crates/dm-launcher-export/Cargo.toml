@@ -9,7 +9,7 @@ publish = false
 chrono = "0.4.45"
 crc32fast = "1.5.1"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde_json = { version = "1.0.151", features = ["float_roundtrip", "preserve_order"] }
 thiserror = "2.0.20"
 
 [dev-dependencies]

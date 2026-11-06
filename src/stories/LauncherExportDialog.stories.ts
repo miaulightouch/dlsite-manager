@@ -73,6 +73,32 @@ export const NothingDetected: Story = {
   args: { options: { ...options, installs: [], compatTools: [] } },
 };
 
+export const PrefixDisagreement: Story = {
+  args: {
+    options: {
+      ...options,
+      existing: [
+        {
+          installId: options.installs[1].id,
+          steamUserId: null,
+          displayName: "Observatory",
+          executable: options.executables[0].path,
+          prefix: "/home/user/Faugus/observatory",
+          compatTool: "Proton-DL",
+        },
+        {
+          installId: options.installs[2].id,
+          steamUserId: null,
+          displayName: "A Long Evening",
+          executable: options.executables[0].path,
+          prefix: options.defaultPrefix,
+          compatTool: "Proton-DL",
+        },
+      ],
+    },
+  },
+};
+
 export const WithResults: Story = {
   args: {
     report: {
@@ -84,6 +110,8 @@ export const WithResults: Story = {
           status: "updated",
           warnings: ["Restart Faugus Launcher to see the change"],
           error: null,
+          needsAcknowledgement: false,
+          needsPrefixChange: false,
           files: [
             {
               path: "/home/user/.local/share/faugus-launcher/games.json",
@@ -99,6 +127,8 @@ export const WithResults: Story = {
           status: "failed",
           warnings: [],
           error: "library.json: invalid JSON; the file was not changed",
+          needsAcknowledgement: false,
+          needsPrefixChange: false,
           files: [],
         },
       ],
