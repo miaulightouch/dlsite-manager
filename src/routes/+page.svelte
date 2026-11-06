@@ -21,6 +21,7 @@
   import type { DiagnosticTarget } from "$lib/utils/diagnostic-message";
   import DownloadsView from "$lib/features/downloads/DownloadsView.svelte";
   import LibraryView from "$lib/features/library/LibraryView.svelte";
+  import LauncherExportDialog from "$lib/features/library/LauncherExportDialog.svelte";
   import ProductDetailDialog from "$lib/features/library/ProductDetailDialog.svelte";
   import ProductImagePreviewView from "$lib/features/library/ProductImagePreview.svelte";
   import SettingsView from "$lib/features/settings/SettingsView.svelte";
@@ -75,6 +76,9 @@
     Toast,
     ToastKind,
     View,
+    LauncherExportOptions,
+    LauncherExportReport,
+    LauncherExportRequest,
   } from "$lib/model/types";
 
   const PRODUCT_PAGE_SIZE = 100;
@@ -140,6 +144,16 @@
   let toasts = $state<Toast[]>([]);
   let productImagePreview = $state<ProductImagePreview | null>(null);
   let productDetail = $state<ProductDetail | null>(null);
+  type LauncherExportState = {
+    workId: string;
+    options: LauncherExportOptions | null;
+    loadError: string | null;
+    exporting: boolean;
+    exportError: string | null;
+    report: LauncherExportReport | null;
+  };
+  let launcherExport = $state<LauncherExportState | null>(null);
+  let launcherExportAvailable = $state(false);
   let productDetailLoadingWorkId = $state<string | null>(null);
   let customTagInput = $state("");
   let bulkDownloadDialog = $state<BulkDownloadDialog | null>(null);
@@ -172,6 +186,10 @@
 
   onMount(() => {
     void loadInitial();
+    void commands
+      .launcherExportSupported()
+      .then((supported) => (launcherExportAvailable = supported))
+      .catch(() => (launcherExportAvailable = false));
 
     const unlisteners: (() => void)[] = [installDiagnosticHandlers()];
     let disposed = false;
@@ -1130,6 +1148,51 @@
     }
   }
 
+  async function openLauncherExport(workId: string) {
+    const dialog: LauncherExportState = {
+      workId,
+      options: null,
+      loadError: null,
+      exporting: false,
+      exportError: null,
+      report: null,
+    };
+    launcherExport = dialog;
+    try {
+      const options = await commands.getLauncherExportOptions(workId);
+      if (launcherExport?.workId === workId) {
+        launcherExport = { ...dialog, options };
+      }
+    } catch (err) {
+      if (launcherExport?.workId === workId) {
+        launcherExport = { ...dialog, loadError: errorMessage(err) };
+      }
+    }
+  }
+
+  async function runLauncherExport(request: LauncherExportRequest) {
+    const current = launcherExport;
+    if (!current) return;
+    launcherExport = { ...current, exporting: true, exportError: null };
+    try {
+      const report = await commands.exportWorkToLaunchers(
+        current.workId,
+        request,
+      );
+      if (launcherExport?.workId === current.workId) {
+        launcherExport = { ...current, report, exporting: false };
+      }
+    } catch (err) {
+      if (launcherExport?.workId === current.workId) {
+        launcherExport = {
+          ...current,
+          exportError: errorMessage(err),
+          exporting: false,
+        };
+      }
+    }
+  }
+
   async function openDownloadedProduct(product: Product) {
     if (!product.download.localPath) {
       return;
@@ -1781,6 +1844,9 @@
     onRedownload={() => productDetail && redownloadProduct(productDetail)}
     onDeleteDownload={() =>
       productDetail && deleteDownloadedProduct(productDetail)}
+    onExportToLaunchers={launcherExportAvailable
+      ? () => productDetail && openLauncherExport(productDetail.workId)
+      : undefined}
     bind:customTagInput
     onClose={closeProductDetail}
     onPreview={openProductImageFromDetail}
@@ -1791,6 +1857,21 @@
     onAddTags={addProductDetailCustomTags}
     onRemoveTag={removeProductDetailCustomTag}
   />
+
+  {#if launcherExport}
+    {#key launcherExport.workId}
+      <LauncherExportDialog
+        workId={launcherExport.workId}
+        options={launcherExport.options}
+        loadError={launcherExport.loadError}
+        exporting={launcherExport.exporting}
+        exportError={launcherExport.exportError}
+        report={launcherExport.report}
+        onExport={runLauncherExport}
+        onClose={() => (launcherExport = null)}
+      />
+    {/key}
+  {/if}
 
   {#if productImagePreview}
     <ProductImagePreviewView

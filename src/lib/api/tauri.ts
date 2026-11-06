@@ -6,6 +6,9 @@ import type {
   AuditEvent,
   BulkWorkDownloadPreview,
   JobSnapshot,
+  LauncherExportOptions,
+  LauncherExportReport,
+  LauncherExportRequest,
   ProductCustomTag,
   ProductDetail,
   ProductDownload,
@@ -149,6 +152,25 @@ export function deleteWorkDownload(workId: string) {
 export function markWorkDownloaded(workId: string, localPath: string) {
   return invoke<ProductDownload>("mark_work_downloaded", {
     request: { workId, localPath },
+  });
+}
+
+export function launcherExportSupported() {
+  return invoke<boolean>("launcher_export_supported");
+}
+
+export function getLauncherExportOptions(workId: string) {
+  return invoke<LauncherExportOptions>("get_launcher_export_options", {
+    request: { workId },
+  });
+}
+
+export function exportWorkToLaunchers(
+  workId: string,
+  exportRequest: LauncherExportRequest,
+) {
+  return invoke<LauncherExportReport>("export_work_to_launchers", {
+    request: { workId, export: exportRequest },
   });
 }
 

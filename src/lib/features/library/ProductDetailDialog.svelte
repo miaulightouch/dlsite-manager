@@ -37,6 +37,7 @@
     onMarkDownloaded,
     onRedownload,
     onDeleteDownload,
+    onExportToLaunchers,
     downloadDisabled = false,
   }: {
     detail: ProductDetail | null;
@@ -58,6 +59,7 @@
     onMarkDownloaded?: () => void;
     onRedownload?: () => void;
     onDeleteDownload?: () => void;
+    onExportToLaunchers?: () => void;
     downloadDisabled?: boolean;
   } = $props();
   const job = $derived(activeJob && isActiveJob(activeJob) ? activeJob : null);
@@ -179,7 +181,11 @@
               variant="text"
               disabled={Boolean(job)}
               onclick={onRedownload}>Re-download</Button
-            >{/if}{#if detail.download.status !== "notDownloaded"}<Button
+            >{#if onExportToLaunchers && detail.download.localPath}<Button
+                variant="text"
+                disabled={Boolean(job)}
+                onclick={onExportToLaunchers}>Export to launchers</Button
+              >{/if}{/if}{#if detail.download.status !== "notDownloaded"}<Button
               variant="text"
               disabled={Boolean(job)}
               tone="error"

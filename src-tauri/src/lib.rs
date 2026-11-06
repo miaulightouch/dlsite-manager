@@ -35,6 +35,7 @@ use tracing_subscriber::prelude::*;
 
 mod desktop;
 mod diagnostics;
+mod launcher_export;
 mod two_factor;
 use two_factor::{JobTwoFactorPrompt, TwoFactorPrompts};
 
@@ -3866,6 +3867,9 @@ pub fn run() {
             submit_two_factor_code,
             cancel_two_factor,
             open_work_download,
+            launcher_export::launcher_export_supported,
+            launcher_export::get_launcher_export_options,
+            launcher_export::export_work_to_launchers,
             delete_work_download,
             mark_work_downloaded,
             scan_local_work_downloads,

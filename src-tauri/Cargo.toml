@@ -24,6 +24,7 @@ dm-audit = { path = "../crates/dm-audit" }
 dm-credentials = { path = "../crates/dm-credentials" }
 dm-download = { path = "../crates/dm-download" }
 dm-jobs = { path = "../crates/dm-jobs" }
+dm-launcher-export = { path = "../crates/dm-launcher-export" }
 dm-library = { path = "../crates/dm-library" }
 dm-storage = { path = "../crates/dm-storage" }
 tauri = { version = "2.11.5", features = [] }

@@ -328,3 +328,57 @@ export type ProductTypeCodeDetail = {
 };
 
 export type View = "library" | "downloads" | "accounts" | "activity" | "settings";
+
+export type LauncherKind = "steam" | "faugus" | "heroic";
+
+export type LauncherInstall = {
+  id: string;
+  launcher: LauncherKind;
+  flavor: "native" | "flatpak";
+  path: string;
+  steamUsers: { id: string; name: string | null }[];
+  running: boolean;
+};
+
+export type LauncherExportOptions = {
+  executables: { path: string; relativePath: string; sizeBytes: number }[];
+  suggestedExecutable: string | null;
+  scanTruncated: boolean;
+  defaultDisplayName: string;
+  defaultPrefix: string;
+  installs: LauncherInstall[];
+  compatTools: { id: string; displayName: string; path: string | null }[];
+  existing: {
+    installId: string;
+    displayName: string | null;
+    executable: string | null;
+    prefix: string | null;
+    compatTool: string | null;
+  }[];
+  warnings: string[];
+};
+
+export type LauncherExportRequest = {
+  executable: string;
+  displayName: string;
+  compatTool: string;
+  prefix: string;
+  targets: { installId: string; steamUserIds: string[] }[];
+  acknowledgeSteamRunning: boolean;
+};
+
+export type LauncherExportReport = {
+  prefix: string;
+  results: {
+    installId: string;
+    launcher: LauncherKind | null;
+    status: "created" | "updated" | "unchanged" | "failed";
+    files: {
+      path: string;
+      action: "created" | "updated" | "unchanged";
+      backup: string | null;
+    }[];
+    warnings: string[];
+    error: string | null;
+  }[];
+};
