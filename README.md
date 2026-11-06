@@ -54,6 +54,14 @@ Add one or more DLsite accounts and sync them into the same unified library. Pro
 
 Existing folders can be scanned into the library as local-only / not-owned works. This lets the app manage downloaded or imported works even when they were not synced from the configured accounts.
 
+### Launcher Export (Linux)
+
+Open a downloaded work and choose **Export to launchers** to add it to Steam, Faugus Launcher or Heroic so it runs through a Proton build you pick. You choose the executable from the `.exe` files in the work's folder, the compatibility tool, the display name and the Wine prefix. Each work defaults to its own prefix under `~/Games/dlsite-manager/prefixes`.
+
+Exporting again updates the same entry. Launcher files are backed up beside the original (`*.dlsite-manager-<time>.bak`) before any change and are left untouched if they cannot be parsed. Prefixes are never deleted. Steam overwrites its files when it exits, so close Steam before exporting; the app warns and asks for confirmation if it is running.
+
+This has been tested only with automated tests against fixture files written from the launchers' source code. It has not yet been tried with real Steam, Faugus Launcher or Heroic installs, or with launching a game. Flatpak launchers need filesystem access to the work, the prefix and the tool, which the app does not configure.
+
 ### Settings
 
 ![Settings page](docs/assets/readme/settings.png)
@@ -133,6 +141,7 @@ The app keeps DLsite/domain behavior in reusable Rust crates and leaves the Taur
 - `crates/dm-storage` - SQLite persistence and SQLx migrations
 - `crates/dm-library` - application services that combine API, storage, credentials, downloads, and local-library behavior
 - `crates/dm-jobs` - background job snapshots, progress, and cancellation
+- `crates/dm-launcher-export` - Linux launcher discovery and Steam, Faugus Launcher and Heroic file formats
 - `crates/dm-audit` - file-backed audit log records
 - `crates/dm-credentials` - app credential storage
 - `src-tauri` - Tauri commands, events, and desktop integration

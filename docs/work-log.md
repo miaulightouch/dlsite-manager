@@ -1294,3 +1294,16 @@
   verification remains in this work log and the completed plans. Documentation
   validation: whitespace check and exact GitHub/local release-body comparison;
   no code tests were needed for this prose-only change.
+
+- Added Linux launcher export for downloaded works: `crates/dm-launcher-export`
+  (discovery, binary/text VDF, Steam, Faugus Launcher and Heroic formats, backup and
+  atomic writes), thin commands in `src-tauri/src/launcher_export.rs`,
+  `LauncherExportDialog.svelte`, and a design note. Validated in a rootless podman
+  container (rust 1.99.1, Node 22, pnpm 12.3.4) because mise is not available there:
+  `cargo fmt --all --check`, workspace all-target Clippy with `-D warnings`,
+  `cargo test --workspace --locked` (live suites returned without credentials),
+  `pnpm run check`, `pnpm test`, `pnpm run build`; `cargo check -p dm-launcher-export`
+  for Windows GNU and macOS targets. Output files also parsed with python-vdf and
+  steam-shortcut-editor, and the dialog stories were checked in a browser. Not run:
+  the packaged app, real launchers, launching a game. Real launcher configs were
+  never read; all tests use temp fixtures.
