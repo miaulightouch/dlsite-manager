@@ -16,7 +16,9 @@
     launcherExportBlockers,
     launcherLabel,
     prefixMoves,
+    resetLauncherExportConsent,
     runningLauncherLabels,
+    runningLauncherMessage,
     type LauncherExportForm,
   } from "$lib/utils/launcher-export";
 
@@ -57,6 +59,20 @@
   const moves = $derived(
     form && options ? prefixMoves(form, options, report) : [],
   );
+  const runningMessage = $derived(
+    form && options ? runningLauncherMessage(form, options, report) : "",
+  );
+  let results = $state<HTMLElement>();
+  // Failures must not sit below the fold, and consent covered only that export.
+  $effect(() => {
+    if (!report) return;
+    const failedRunning = report.results.some((r) => r.needsAcknowledgement);
+    const failedMove = report.results.some((r) => r.needsPrefixChange);
+    untrack(() => {
+      if (form && !failedRunning && !failedMove) resetLauncherExportConsent(form);
+      results?.scrollIntoView({ block: "nearest" });
+    });
+  });
   const statusLabels = {
     created: "Added",
     updated: "Updated",
@@ -147,10 +163,7 @@
           {#if runningLabels.length}
             <div class="warning" role="alert">
               <p>
-                {runningLabels.join(", ")} running. A running launcher can overwrite
-                or drop this export: Steam when it exits, Faugus Launcher on its next
-                save, Heroic when it next saves the game's settings. Close it first if
-                you can.
+                {runningMessage}
               </p>
               <label class="check">
                 <input type="checkbox" bind:checked={form.acknowledgeRunning} />
@@ -239,7 +252,11 @@
         {/if}
 
         {#if report}
-          <section aria-label="Export results" aria-live="polite">
+          <section
+            bind:this={results}
+            aria-label="Export results"
+            aria-live="polite"
+          >
             {#each report.results as result}
               <div class="result" class:failed={result.status === "failed"}>
                 <strong>

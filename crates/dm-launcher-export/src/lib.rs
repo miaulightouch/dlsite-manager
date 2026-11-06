@@ -465,6 +465,13 @@ fn run_target(
         .map_err(plain)?;
     warnings.extend(plan.warnings);
     let files = commit_all(plan.writes)?;
+    if files
+        .iter()
+        .all(|file| file.action == FileAction::Unchanged)
+    {
+        // Nothing was written, so a running launcher has nothing to overwrite.
+        warnings.retain(|warning| warning != running_warning(install.launcher));
+    }
     Ok((plan.created, files, warnings))
 }
 
@@ -764,6 +771,13 @@ mod tests {
         assert!(accepted.results[1].warnings[0].contains("next save"));
         assert!(games.exists());
         assert!(accepted.results[2].warnings[0].contains("overwrite"));
+
+        let unchanged = run_export(&home.env, &home.work, &request).unwrap();
+        assert_eq!(statuses(&unchanged), vec![TargetStatus::Unchanged; 3]);
+        assert!(unchanged
+            .results
+            .iter()
+            .all(|result| result.warnings.is_empty()));
     }
 
     #[test]

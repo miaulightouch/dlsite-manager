@@ -92,19 +92,55 @@ function selectedInstalls(
  * Selected launchers known to be running. The backend's refusal counts too: the
  * snapshot in `options` is older than the export and a launcher may have started.
  */
-export function runningLauncherLabels(
+function runningInstalls(
   form: LauncherExportForm,
   options: LauncherExportOptions,
-  report: LauncherExportReport | null = null,
+  report: LauncherExportReport | null,
 ) {
   const refused = new Set(
     report?.results
       .filter((result) => result.needsAcknowledgement)
       .map((result) => result.installId),
   );
-  return selectedInstalls(form, options)
-    .filter((install) => install.running || refused.has(install.id))
-    .map(launcherLabel);
+  return selectedInstalls(form, options).filter(
+    (install) => install.running || refused.has(install.id),
+  );
+}
+
+export function runningLauncherLabels(
+  form: LauncherExportForm,
+  options: LauncherExportOptions,
+  report: LauncherExportReport | null = null,
+) {
+  return runningInstalls(form, options, report).map(launcherLabel);
+}
+
+const runningRisks = {
+  steam: "Steam overwrites its files when it exits.",
+  faugus: "Faugus Launcher drops new entries when it next saves.",
+  heroic: "Heroic can overwrite a game's settings when it next saves them.",
+} as const;
+
+/** The warning for selected launchers that are running; empty when none are. */
+export function runningLauncherMessage(
+  form: LauncherExportForm,
+  options: LauncherExportOptions,
+  report: LauncherExportReport | null = null,
+) {
+  const installs = runningInstalls(form, options, report);
+  if (!installs.length) return "";
+  const names = [...new Set(installs.map(launcherLabel))];
+  const verb = names.length === 1 ? "is" : "are";
+  const risks = [...new Set(installs.map((i) => runningRisks[i.launcher]))];
+  return `${names.join(", ")} ${verb} running. ${risks.join(" ")} Close ${
+    names.length === 1 ? "it" : "them"
+  } first if you can.`;
+}
+
+/** Consent covers one export: anything changed afterwards must be confirmed again. */
+export function resetLauncherExportConsent(form: LauncherExportForm) {
+  form.allowPrefixChange = false;
+  form.acknowledgeRunning = false;
 }
 
 /** What an earlier export of this work stored, for one launcher. */

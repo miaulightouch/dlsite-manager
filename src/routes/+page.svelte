@@ -1179,8 +1179,12 @@
         current.workId,
         request,
       );
+      // Earlier-export details just changed; the open form must not show old ones.
+      const options = await commands
+        .getLauncherExportOptions(current.workId)
+        .catch(() => current.options);
       if (launcherExport?.workId === current.workId) {
-        launcherExport = { ...current, report, exporting: false };
+        launcherExport = { ...current, options, report, exporting: false };
       }
     } catch (err) {
       if (launcherExport?.workId === current.workId) {

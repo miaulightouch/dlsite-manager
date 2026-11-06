@@ -7,7 +7,9 @@ import {
   launcherExportBlockers,
   launcherLabel,
   prefixMoves,
+  resetLauncherExportConsent,
   runningLauncherLabels,
+  runningLauncherMessage,
 } from "./launcher-export";
 
 const options: LauncherExportOptions = {
@@ -229,6 +231,33 @@ describe("launcher export form", () => {
     expect(launcherExportBlockers(form, options)).toEqual([
       "Choose at least one Steam user.",
     ]);
+  });
+
+  it("describes only the running launchers that are selected", () => {
+    const running = {
+      ...options,
+      installs: options.installs.map((install) => ({ ...install, running: true })),
+    };
+    const form = initialLauncherExportForm(running);
+    expect(runningLauncherMessage(form, running)).toBe("");
+    form.selected["steam:/s"] = true;
+    expect(runningLauncherMessage(form, running)).toBe(
+      "Steam is running. Steam overwrites its files when it exits. Close it first if you can.",
+    );
+    form.selected["heroic:/h"] = true;
+    expect(runningLauncherMessage(form, running)).toContain(
+      "Steam, Heroic (Flatpak) are running.",
+    );
+    expect(runningLauncherMessage(form, running)).toContain("Close them first");
+  });
+
+  it("asks for consent again after an export", () => {
+    const form = initialLauncherExportForm(options);
+    form.allowPrefixChange = true;
+    form.acknowledgeRunning = true;
+    resetLauncherExportConsent(form);
+    expect(form.allowPrefixChange).toBe(false);
+    expect(form.acknowledgeRunning).toBe(false);
   });
 
   it("labels flatpak installs", () => {
