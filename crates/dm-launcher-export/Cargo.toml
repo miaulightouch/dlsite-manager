@@ -1,0 +1,19 @@
+[package]
+name = "dm-launcher-export"
+version = "3.3.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+chrono = "0.4.45"
+crc32fast = "1.5.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.20"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true
